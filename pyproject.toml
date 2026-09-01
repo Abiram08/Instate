@@ -1,0 +1,35 @@
+[project]
+name = "instate"
+version = "0.1.0"
+description = "The state of record for agents that move money"
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "aiosqlite>=0.20",
+    "typer>=0.12",
+    "pydantic>=2.0",
+    "google-genai>=1.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+instate = "instate.cli.main:app"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100

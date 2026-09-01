@@ -1,0 +1,47 @@
+# ---- Design docs (moved to docs/) ----
+# NOTE: these are listed here as requested — remove this block if you
+# want the pitch/design docs tracked in git instead of ignored.
+docs/idea.md
+docs/architecture.md
+docs/design-review.md
+docs/diagrams.md
+docs/02-development-plan.md
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Env / secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- Local tooling (instate CLI) ----
+*.log
+dist/
+build/
+*.egg-info/
+
+# ---- Local runtime data (never commit) ----
+*.db
+*.sqlite
+*.sqlite3
+cold_archive/
+.hypothesis/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
