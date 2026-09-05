@@ -1,12 +1,8 @@
 # ---- Design docs (moved to docs/) ----
-# NOTE: these are listed here as requested — remove this block if you
+# NOTE: these are listed here as requested - remove this block if you
 # want the pitch/design docs tracked in git instead of ignored.
-docs/idea.md
-docs/architecture.md
-docs/design-review.md
-docs/diagrams.md
-docs/02-development-plan.md
-docs/history.md
+docs/
+demo/
 
 # ---- Python ----
 __pycache__/
