@@ -1,24 +1,10 @@
-"""The comparison runner — one batch, two agents, one honest table (§11).
-
-FAIRNESS CONTRACT (the whole demo stands on this):
-
-- The SAME scripted model serves both agents — same capability, same
-  proposals for the same context. The ONLY difference is what each agent
-  FEEDS it: the baseline re-derives and stuffs the full raw history (no
-  policy framing, no digest); Instate provides the bounded digest with
-  the policy version in force. Context quality is the memory layer's
-  product — that difference IS the experiment.
-- The SAME realistic gateway punishes the same mistakes on both sides:
-  immediate retries on insufficient funds fail (payday hasn't come),
-  retries on hard-declined methods fail, and the 4th+ attempt fails.
-- The SAME seed generates identical history and an identical batch for
-  both, in isolated databases.
-
-Deltas that survive that contract are attributable to the memory layer.
-"""
+"""Comparison runner: identical batch through both agents in isolated DBs.
+Contract: same scripted model, same gateway, same seed; only context differs
+(raw dump vs bounded digest)."""
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -29,7 +15,9 @@ from instate.agent.decide import drain_pending
 from instate.agent.execute import run_due_scheduled
 from instate.core.ledger import record_event
 from instate.core.models import (
+    ACTION_CHECK_METHOD_UPDATED,
     ACTION_ESCALATE_HUMAN,
+    ACTION_RETRY_BACKUP_METHOD,
     ACTION_RETRY_NOW,
     ACTION_RETRY_SCHEDULED,
     ACTION_SEND_PAYMENT_LINK,
@@ -50,19 +38,12 @@ _CODE_TO_CAUSE = {
 
 
 # ---------------------------------------------------------------------------
-# The shared scripted model — the ONLY model in the experiment
+# Shared scripted model
 # ---------------------------------------------------------------------------
 
 
 class SharedScriptedReasoner:
-    """A decent model. It proposes the same thing for the same intent —
-    but it can only be as good as the context it is fed.
-
-    - With the Instate digest (policy_version present), it has the
-      taxonomy framing: insufficient funds → schedule payday-aligned.
-    - With the baseline's raw dump, it does the human-naive thing:
-      'payment failed → retry now'.
-    That difference in context IS what the memory layer provides."""
+    """Shared scripted model; output depends on context (digest vs raw dump)."""
 
     model_name = "scripted-shared-model"
     last_usage = (900, 60)
@@ -102,21 +83,20 @@ class SharedScriptedReasoner:
 
 
 # ---------------------------------------------------------------------------
-# The realistic gateway — mistakes cost the same on both sides
+# Realistic gateway
 # ---------------------------------------------------------------------------
 
 
 class RealisticGateway:
-    """Models how cards actually behave:
+    """Same gateway for both arms: <48h insufficient-funds retry fails;
+    hard-decline fails until method changes; 4th+ attempt fails; links succeed."""
 
-    - insufficient funds: a retry before payday (< 48h) FAILS
-    - hard-declined method: every retry FAILS until the method changes
-    - 4th+ attempt: FAILS (the network stops honoring the credential)
-    - payment links: always succeed
-    """
+    # Codes where variant B converts and A does not; both arms share seeds.
+    B_LIFTS_THESE_CODES = {"card_expired", "CARD_EXPIRED"}
 
-    def __init__(self, amount_minor: int = 49900):
+    def __init__(self, amount_minor: int = 49900, link_variant: str = "A"):
         self.amount_minor = amount_minor
+        self.link_variant = link_variant
         self.now = datetime.now(UTC)
         self.failures: dict[str, tuple[str, datetime]] = {}
         self.attempts: dict[str, int] = {}
@@ -126,31 +106,53 @@ class RealisticGateway:
     def note_failure(self, entity_id: str, code: str | None, at: datetime) -> None:
         self.failures[entity_id] = (code or "UNKNOWN", at)
 
+    def _retry_attempt(self, entity_id: str) -> GatewayResponse:
+        code, failed_at = self.failures.get(entity_id, ("UNKNOWN", self.now))
+        if code in (
+            "card_expired",
+            "fraud_block",
+            "mandate_inactive",
+            "lost_card",
+            "stolen_card",
+        ):
+            if entity_id not in self.method_changed:
+                return GatewayResponse("failed", detail="hard decline: method not updated")
+        if code == "insufficient_funds" and self.now - failed_at < timedelta(hours=48):
+            return GatewayResponse("failed", detail="insufficient funds — no payday yet")
+        count = self.attempts.get(entity_id, 0) + 1
+        if count > 3:
+            return GatewayResponse("failed", detail="credential attempts exhausted")
+        self.attempts[entity_id] = count
+        return GatewayResponse(
+            "completed", provider_ref=f"pay_{len(self.calls)}", amount_minor=self.amount_minor
+        )
+
     async def execute(self, action, *, entity_id, idempotency_key, payload=None):
         self.calls.append(
             {"action": action, "entity_id": entity_id, "idempotency_key": idempotency_key}
         )
         if action in ("SEND_PAYMENT_LINK", "REQUEST_PAYMENT_METHOD", "UPDATE_MANDATE"):
-            return GatewayResponse("completed", provider_ref=f"link_{len(self.calls)}")
-        if action == ACTION_RETRY_NOW:
-            code, failed_at = self.failures.get(entity_id, ("UNKNOWN", self.now))
-            if code in (
-                "card_expired",
-                "fraud_block",
-                "mandate_inactive",
-                "lost_card",
-                "stolen_card",
-            ):
-                if entity_id not in self.method_changed:
-                    return GatewayResponse("failed", detail="hard decline: method not updated")
-            if code == "insufficient_funds" and self.now - failed_at < timedelta(hours=48):
-                return GatewayResponse("failed", detail="insufficient funds — no payday yet")
-            count = self.attempts.get(entity_id, 0) + 1
-            if count > 3:
-                return GatewayResponse("failed", detail="credential attempts exhausted")
-            self.attempts[entity_id] = count
+            code, _ = self.failures.get(entity_id, ("UNKNOWN", self.now))
+            converted = self.link_variant == "B" or code not in self.B_LIFTS_THESE_CODES
             return GatewayResponse(
-                "completed", provider_ref=f"pay_{len(self.calls)}", amount_minor=self.amount_minor
+                "completed",
+                provider_ref=f"link_{len(self.calls)}",
+                data={"converted": converted, "variant": self.link_variant},
+            )
+        if action == ACTION_RETRY_NOW:
+            return self._retry_attempt(entity_id)
+        if action == ACTION_RETRY_BACKUP_METHOD:
+            # A different instrument: the dead primary's block is
+            # irrelevant — same budget accounting as a normal retry.
+            code, _ = self.failures.get(entity_id, ("UNKNOWN", self.now))
+            if code in ("fraud_block",):
+                return GatewayResponse("failed", detail="fraud: backup blocked too")
+            return self._retry_attempt(entity_id)
+        if action == ACTION_CHECK_METHOD_UPDATED:
+            return GatewayResponse(
+                "completed",
+                provider_ref=f"probe_{len(self.calls)}",
+                data={"method_updated": entity_id in self.method_changed},
             )
         return GatewayResponse("failed", detail=f"unsupported {action}")
 
@@ -159,7 +161,7 @@ class RealisticGateway:
 
 
 # ---------------------------------------------------------------------------
-# Isolated setup — one agent per database, identical seed
+# Isolated setup
 # ---------------------------------------------------------------------------
 
 
@@ -168,19 +170,32 @@ class _Setup:
     engine: object
     factory: async_sessionmaker
     session: AsyncSession
-    gateway: RealisticGateway
+    gateway: Any  # RealisticGateway (stand-in) or RazorpayGateway (test-mode)
     merchant_id: UUID
     batch: list = field(default_factory=list)
 
 
-async def _fresh_setup(seed: int, entities: int, now: datetime) -> _Setup:
+def _note_failure(setup: _Setup, entity_id: str, code: str | None, at: datetime) -> None:
+    """Stand-in bookkeeping; real gateways have no scripted failure table."""
+    note = getattr(setup.gateway, "note_failure", None)
+    if callable(note):
+        note(entity_id, code, at)
+
+
+def _set_now(setup: _Setup, at: datetime) -> None:
+    if hasattr(setup.gateway, "now"):
+        setup.gateway.now = at
+
+
+async def _fresh_setup(
+    seed: int, entities: int, now: datetime, gateway: Any | None = None
+) -> _Setup:
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
-    # init_db uses the database.py singleton — build schema directly so the
-    # two setups are fully isolated from each other and from the singleton.
+    # Build schema directly for full isolation (bypasses database.py singleton).
     from instate.core.models import Base
 
     async with engine.begin() as conn:
@@ -201,15 +216,12 @@ async def _fresh_setup(seed: int, entities: int, now: datetime) -> _Setup:
         engine=engine,
         factory=factory,
         session=session,
-        gateway=RealisticGateway(),
+        gateway=gateway or RealisticGateway(),
         merchant_id=merchant_id,
     )
 
 
-# The batch: aimed so the gates have something to gate. sub_000 is a
-# recovered_retry (rich history), sub_004 is at-ceiling (3 retries this
-# week — Gate-1 must deny), sub_008 is open with follow-up contacts; the
-# fresh entities cover the remaining root causes.
+# Batch covers gated cases: at-ceiling, open with contacts, fresh root causes.
 BATCH_ENTITIES = ["sub_000", "sub_004", "sub_008", "fresh_b", "fresh_c", "fresh_d"]
 BATCH_CODES = [
     "insufficient_funds",
@@ -222,12 +234,7 @@ BATCH_CODES = [
 
 
 async def _fatten_history(setup: _Setup, entity_id: str, n: int = 10) -> None:
-    """Give one entity a long follow-up history (10 contacts over 3 weeks).
-
-    Identical on both sides — this is what makes the context-reduction
-    claim measurable: the baseline's dump grows with every event; the
-    digest stays bounded at the last 5.
-    """
+    """Add a long follow-up history (10 contacts), identically on both sides."""
     from instate.core.projection import fold_events
 
     now = datetime.now(UTC)
@@ -247,22 +254,41 @@ async def _fatten_history(setup: _Setup, entity_id: str, n: int = 10) -> None:
     await setup.session.commit()
 
 
+class _VariantReasoner:
+    """Stamps variant onto proposals for per-variant conversion measurement."""
+
+    def __init__(self, inner, variant: str):
+        self._inner = inner
+        self._variant = variant
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    async def propose(self, context: dict) -> dict | None:
+        raw = await self._inner.propose(context)
+        if isinstance(raw, dict):
+            return {**raw, "variant": self._variant}
+        return raw
+
+
 async def run_comparison(
     *,
     entities: int = 10,
     seed: int = 42,
     now: datetime | None = None,
     due_scan_after: timedelta = timedelta(hours=72),
+    link_variant: str = "A",
 ) -> dict:
-    """Run the identical batch through both agents in isolated DBs and
-    return {baseline, instate, table} — the demo's money shot."""
+    """Run the identical batch through both agents; return {baseline, instate, table}."""
     now = now or datetime.now(UTC)
 
     base = await _fresh_setup(seed, entities, now)
     inst = await _fresh_setup(seed, entities, now)
+    for setup in (base, inst):
+        if hasattr(setup.gateway, "link_variant"):
+            setup.gateway.link_variant = link_variant
 
-    # Identical fattening on both sides — on guaranteed batch targets so
-    # the context-reduction delta holds even for small demo sizes
+    # Identical fattening on both sides.
     for eid in ("sub_000", "sub_004"):
         await _fatten_history(base, eid)
         await _fatten_history(inst, eid)
@@ -287,27 +313,29 @@ async def run_comparison(
     for setup, batch in ((base, batch_base), (inst, batch_inst)):
         for event in batch:
             code = (event.payload or {}).get("failure_code")
-            setup.gateway.note_failure(event.entity_id, code, now)
+            _note_failure(setup, event.entity_id, code, now)
 
-    # Baseline run — no gates, no caps, full raw context every time
-    baseline_agent = StatelessBaselineAgent(SharedScriptedReasoner(), base.gateway)
+    # Baseline: no gates, full raw context.
+    baseline_agent = StatelessBaselineAgent(
+        _VariantReasoner(SharedScriptedReasoner(), link_variant), base.gateway
+    )
     baseline_results = [
         await baseline_agent.process_failure(base.session, event=event, now=now)
         for event in batch_base
     ]
     await base.session.commit()
 
-    # Instate run — the same model through the gated pipeline
-    instate_reasoner = SharedScriptedReasoner()
+    # Instate: same model through the gated pipeline.
+    instate_reasoner = _VariantReasoner(SharedScriptedReasoner(), link_variant)
     instate_results = await drain_pending(
         inst.session, reasoner=instate_reasoner, gateway=inst.gateway, now=now
     )
     await inst.session.commit()
 
-    # The tick: payday arrives — due scheduled retries execute on both sides
+    # Advance to payday; run due scheduled retries on both sides.
     later = now + due_scan_after
     for setup in (base, inst):
-        setup.gateway.now = later
+        _set_now(setup, later)
         await run_due_scheduled(setup.session, gateway=setup.gateway, now=later)
         await setup.session.commit()
 
@@ -327,3 +355,75 @@ async def run_comparison(
         "instate_reasoner": instate_reasoner,
         "table": table,
     }
+
+
+async def run_ab_test(
+    *,
+    entities: int = 10,
+    seed: int = 42,
+    now: datetime | None = None,
+) -> dict:
+    """A/B link wording (A vs B) on identical seeded batches; returns conversion and table."""
+    now = now or datetime.now(UTC)
+    conv = {}
+    for variant in ("A", "B"):
+        arm = await _conversion_for_run(entities=entities, seed=seed, now=now, link_variant=variant)
+        conv[variant] = arm.get(variant, {"sent": 0, "converted": 0})
+
+    table_lines = [
+        f"{'variant':<12}{'links sent':>12}{'converted':>12}{'rate':>10}",
+        "-" * 46,
+    ]
+    for variant in ("A", "B"):
+        sent = conv[variant].get("sent", 0)
+        conv_n = conv[variant].get("converted", 0)
+        rate = f"{conv_n / sent:.0%}" if sent else "—"
+        table_lines.append(f"{variant:<12}{sent:>12}{conv_n:>12}{rate:>10}")
+    table_lines.append("-" * 46)
+    winner = "B" if conv["B"].get("converted", 0) > conv["A"].get("converted", 0) else "A"
+    table_lines.append(
+        "winner: variant " + winner + " (scripted lift — production reads real link conversions)"
+    )
+    return {"conversion": conv, "table": "\n".join(table_lines)}
+
+
+async def _conversion_for_run(
+    *,
+    entities: int,
+    seed: int,
+    now: datetime,
+    link_variant: str,
+) -> dict:
+    """One gated-agent run returning link conversion (separate session)."""
+    from instate.replay.metrics import link_conversion_by_variant
+
+    inst = await _fresh_setup(seed, entities, now)
+    if hasattr(inst.gateway, "link_variant"):
+        inst.gateway.link_variant = link_variant
+    for eid in ("sub_000", "sub_004"):
+        await _fatten_history(inst, eid)
+
+    batch = await generate_failure_batch(
+        inst.session,
+        merchant_id=inst.merchant_id,
+        entity_ids=BATCH_ENTITIES,
+        codes=BATCH_CODES,
+        now=now,
+        prefix="batch",
+    )
+    for event in batch:
+        code = (event.payload or {}).get("failure_code")
+        _note_failure(inst, event.entity_id, code, now)
+
+    reasoner = _VariantReasoner(SharedScriptedReasoner(), link_variant)
+    await drain_pending(inst.session, reasoner=reasoner, gateway=inst.gateway, now=now)
+    await inst.session.commit()
+    later = now + timedelta(hours=72)
+    _set_now(inst, later)
+    await run_due_scheduled(inst.session, gateway=inst.gateway, now=later)
+    await inst.session.commit()
+
+    conv = await link_conversion_by_variant(inst.session, merchant_id=inst.merchant_id)
+    await inst.session.close()
+    await inst.engine.dispose()
+    return conv

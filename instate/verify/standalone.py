@@ -1,8 +1,5 @@
-"""Standalone verifier — audit without our service (§15).
-
-An external auditor exports raw rows (SELECT * FROM events WHERE
-merchant_id = $1 ORDER BY id) and re-derives every chain with zero
-dependency on our code. That's what 'tamper-evident' means to a bank.
+"""Standalone chain verifier; no dependency on service code.
+Auditor exports event rows ordered by id and re-derives hashes.
 """
 
 import hashlib
@@ -13,16 +10,7 @@ def verify_exported_rows(
     rows: list[dict],
     anchors: list[dict] | None = None,
 ) -> dict:
-    """rows: exported dicts with id, merchant_id, entity_id, event_type,
-    occurred_at (ISO), payload_hash (hex), prev_hash (hex|None), hash (hex).
-
-    anchors: exported ArchiveAnchor dicts with entity_id, anchor_hash
-    (hex), archived_through_event_id — the cold prefix each hot chain
-    continues from. A hot chain whose first link is vouched by an anchor
-    verifies; a cut with no (or a wrong) anchor is a break.
-
-    Returns {verified: bool, events: int, breaks: list}.
-    """
+    """Verify exported event chains; returns {verified, events, breaks}. A hot chain starting from a matching anchor verifies."""
     by_entity: dict[str, list[dict]] = {}
     for r in sorted(rows, key=lambda x: x["id"]):
         by_entity.setdefault(r["entity_id"], []).append(r)
@@ -50,8 +38,7 @@ def verify_exported_rows(
                     breaks.append(f"{entity_id}@{e['id']}: prev_hash mismatch")
                     prev = e["hash"]
                     continue
-                # Vouched: the recompute below must use the REAL prev_hash
-                # (the archived link), not the empty genesis seed.
+                # Vouched: recompute with the archived prev_hash, not the genesis seed.
                 exp_prev = got_prev
             # recompute payload_hash check is implicit via hash
             h = hashlib.sha256()

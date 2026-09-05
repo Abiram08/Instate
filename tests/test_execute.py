@@ -1,9 +1,4 @@
-"""Tests for the outbox and the boot reconciler (build item 7).
-
-This is the failure demo, as tests: intent written BEFORE the gateway
-call, outcome after, and a crash mid-action reconciled on "boot" —
-with exactly-once semantics enforced by the idempotency key.
-"""
+"""Outbox and boot reconciler tests: intent-before-call ordering and exactly-once recovery."""
 
 from datetime import timedelta
 
@@ -93,13 +88,12 @@ def test_make_idempotency_key_is_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# The outbox — order is the invariant
+# Outbox
 # ---------------------------------------------------------------------------
 
 
 async def test_intent_is_written_and_committed_before_gateway(session: AsyncSession):
-    """execute_action: intent event lands durably, THEN the gateway is
-    called exactly once with the deterministic key."""
+    """Intent is committed before the gateway call, once with deterministic key."""
     merchant = make_merchant_id()
     gateway = FakeGateway(status="completed")
     decision = await new_decision(session, merchant, "sub_outbox")
@@ -120,18 +114,16 @@ async def test_intent_is_written_and_committed_before_gateway(session: AsyncSess
     assert key == make_idempotency_key(merchant, "sub_outbox", decision.id)
 
     types = await event_types_of(session, merchant, "sub_outbox")
-    # ordered by id: the intent was written (and committed) BEFORE the call
     assert types == ["ActionIntended", "ActionCompleted", "RetryAttempted"]
 
     intent = await session.execute(select(Event).where(Event.event_type == "ActionIntended"))
     intent_event = intent.scalar_one()
-    assert intent_event.source_event_id == key  # UNIQUE → double-intent impossible
+    assert intent_event.source_event_id == key
     assert intent_event.decision_id == decision.id
 
 
 async def test_gateway_unknown_leaves_intent_dangling(session: AsyncSession):
-    """A timeout/5xx is 'unknown': the intent stands, no completion is
-    written — reconciliation owns the resolution (exactly-once)."""
+    """Unknown gateway status leaves intent dangling for reconciliation."""
     merchant = make_merchant_id()
     gateway = FakeGateway(status="unknown")
     decision = await new_decision(session, merchant, "sub_unknown")
@@ -153,8 +145,7 @@ async def test_gateway_unknown_leaves_intent_dangling(session: AsyncSession):
 
 
 async def test_contact_actions_write_customer_contacted(session: AsyncSession):
-    """Link/mandate actions are customer contacts: the fold-visible
-    CustomerContacted event carries the channel (caps key on it)."""
+    """Link/mandate actions also write CustomerContacted with channel."""
     merchant = make_merchant_id()
     gateway = FakeGateway(status="completed")
     decision = await new_decision(session, merchant, "sub_link")
@@ -175,8 +166,7 @@ async def test_contact_actions_write_customer_contacted(session: AsyncSession):
 
 
 async def test_write_intent_is_idempotent(session: AsyncSession):
-    """A second intent with the same key hits the ledger's UNIQUE
-    constraint — the double-intent is impossible by construction."""
+    """Second intent with same key hits UNIQUE constraint."""
     merchant = make_merchant_id()
     decision = await new_decision(session, merchant, "sub_dup")
 
@@ -219,7 +209,7 @@ async def test_escalation_writes_event_and_marks_decision(session: AsyncSession)
 
 
 # ---------------------------------------------------------------------------
-# The boot reconciler — the failure demo
+# Boot reconciler
 # ---------------------------------------------------------------------------
 
 
@@ -238,9 +228,7 @@ async def _dangling_intent(session, merchant, entity_id: str, action="SEND_PAYME
 
 
 async def test_reconciler_completes_known_work(session: AsyncSession):
-    """Crash after Razorpay accepted, before the receipt was written:
-    boot → lookup finds it → ActionCompleted written, gateway NOT
-    re-called. The crash lost a receipt, not money."""
+    """Crash after accept, before receipt → reconcile completes without re-calling."""
     merchant = make_merchant_id()
     decision, key = await _dangling_intent(session, merchant, "sub_recon")
     gateway = FakeGateway(known={key: GatewayResponse("completed", provider_ref="rp_123")})
@@ -255,8 +243,7 @@ async def test_reconciler_completes_known_work(session: AsyncSession):
 
 
 async def test_reconciler_reexecutes_unknown_work_with_same_key(session: AsyncSession):
-    """Crash BEFORE Razorpay got the call: boot → lookup finds nothing →
-    re-execute with the SAME idempotency key (exactly-once)."""
+    """Crash before accept → re-execute with same idempotency key."""
     merchant = make_merchant_id()
     decision, key = await _dangling_intent(session, merchant, "sub_recon2")
     gateway = FakeGateway(known={})  # Razorpay knows nothing about it
@@ -304,12 +291,10 @@ async def test_reconciler_noop_on_clean_boot(session: AsyncSession):
 
 
 async def test_full_crash_cycle_end_to_end(session: AsyncSession):
-    """THE demo, as a test: execute → (unknown) → crash → reboot →
-    reconcile → completed, with the outcome event written exactly once."""
+    """Crash cycle: unknown → reboot → reconcile completes exactly once."""
     merchant = make_merchant_id()
     decision = await new_decision(session, merchant, "sub_crash")
 
-    # First attempt: the gateway times out ("unknown") — then the process dies
     crash_gateway = FakeGateway(status="unknown")
     await execute_action(
         session,
@@ -323,7 +308,6 @@ async def test_full_crash_cycle_end_to_end(session: AsyncSession):
     types = await event_types_of(session, merchant, "sub_crash")
     assert "ActionCompleted" not in types
 
-    # Reboot: Razorpay HAD actually accepted it before the timeout
     key = make_idempotency_key(merchant, "sub_crash", decision.id)
     boot_gateway = FakeGateway(known={key: GatewayResponse("completed", provider_ref="rp_9")})
     resolved = await reconcile_pending(session, gateway=boot_gateway)

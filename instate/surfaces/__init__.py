@@ -1,1 +1,1 @@
-"""Instate surfaces — thin adapters over a protocol-free core (§8)."""
+"""Instate surfaces — thin adapters over a protocol-free core."""

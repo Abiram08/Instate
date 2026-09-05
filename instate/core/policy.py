@@ -1,20 +1,7 @@
-"""Instate L2 policy — declarative, versioned rules for what is allowed.
+"""L2 policy: versioned counter and context rules (§3).
 
-This is the gate tier (§3 of architecture.md). Policy is rows, not code:
-every rule is versioned, and every rule cites its source, so the answer to
-"what rules applied when we made this call?" is a query, not an archaeology
-dig.
-
-Two rule shapes:
-- **Counter rules** (`metric` set, e.g. retry_count_7d): the gate computes
-  `observed` as an indexed L0 count over the rule's window and fires the
-  verdict when `observed >= limit_value`.
-- **Context rules** (`metric` None): fire purely on `applies_when` matching
-  the decision context (root cause, issuer country, ...). These encode the
-  "this situation is never auto-handled" rules — mandate re-auth, fraud.
-
-Every decision records the `policy_version` in force, so a rule change
-never rewrites history — it only affects future decisions.
+Counter rules fire when an indexed L0 count >= limit; context rules fire
+on applies_when match. Decisions record the policy_version in force.
 """
 
 from sqlalchemy import func, select
@@ -36,6 +23,7 @@ from instate.core.projection import RETRY_EVENT_TYPES, CONTACT_EVENT_TYPES
 # metric can be capped over different windows by different rules.
 METRIC_EVENT_TYPES: dict[str, set[str]] = {
     "retry_count_7d": RETRY_EVENT_TYPES,
+    "retry_count_72h": RETRY_EVENT_TYPES,
     "retry_count_24h": RETRY_EVENT_TYPES,
     "contacts_24h": CONTACT_EVENT_TYPES,
     "contacts_1h": CONTACT_EVENT_TYPES,
@@ -46,9 +34,6 @@ METRIC_EVENT_TYPES: dict[str, set[str]] = {
 # Default rules — the L2 seed, keyed on real decline reasons (§6 taxonomy)
 # ---------------------------------------------------------------------------
 
-# `source` is not decoration: a rule that cites its regulation turns a
-# hypothetical compliance story into a concrete one. Verify the current
-# rule text against primary sources before hardcoding beyond the demo.
 DEFAULT_POLICY_RULES: list[dict] = [
     {
         "rule_id": "retry_ceiling_7d",
@@ -104,6 +89,53 @@ DEFAULT_POLICY_RULES: list[dict] = [
         "applies_when": {"issuer_country": "IN"},
         "source": "RBI e-mandate: India-issued instruments need pre-debit authorisation; auto-retry not permitted",
     },
+    # --- Razorpay's real retry model, as rows (docs: Subscriptions > Payment Retries)
+    {
+        "rule_id": "upi_daily_retry_cap",
+        "metric": "retry_count_24h",
+        "limit_value": 1,
+        "window_seconds": 24 * 3600,
+        "verdict": VERDICT_DENY,
+        "applies_when": {"method": "upi"},
+        "source": "Razorpay retry model: UPI re-attempted once daily (T+1, T+2, T+3), then halted",
+    },
+    {
+        "rule_id": "card_daily_retry_cap",
+        "metric": "retry_count_24h",
+        "limit_value": 1,
+        "window_seconds": 24 * 3600,
+        "verdict": VERDICT_DENY,
+        "applies_when": {"method": "card"},
+        "source": "Razorpay retry model: cards re-attempted once daily (T+1, T+2, T+3), then halted",
+    },
+    {
+        "rule_id": "emandate_retry_spacing_72h",
+        "metric": "retry_count_72h",
+        "limit_value": 1,
+        "window_seconds": 72 * 3600,
+        "verdict": VERDICT_DENY,
+        "applies_when": {"method": "emandate"},
+        "source": "Razorpay retry model: e-mandate retries only on confirmation/rejection (24h+)",
+    },
+    {
+        "rule_id": "emandate_require_confirmation",
+        "metric": None,
+        "limit_value": 0,
+        "window_seconds": None,
+        "verdict": VERDICT_REQUIRE_HUMAN,
+        "applies_when": {"method": "emandate", "confirmed": False},
+        "source": "Razorpay retry model: never retry an unconfirmed mandate debit without review",
+    },
+    # --- Jurisdiction-keyed caps (regulators scrutinize per-jurisdiction frequency)
+    {
+        "rule_id": "contact_freq_24h_TRAI",
+        "metric": "contacts_24h",
+        "limit_value": 1,
+        "window_seconds": 24 * 3600,
+        "verdict": VERDICT_DENY,
+        "applies_when": {"jurisdiction": "IN"},
+        "source": "TRAI regime: 1 customer contact per 24h for Indian recipients (stricter than generic cap)",
+    },
 ]
 
 
@@ -118,11 +150,7 @@ async def seed_default_policy(
     entity_type: str = "subscription",
     version: int = 1,
 ) -> int:
-    """Insert the default policy rows for an entity type at a version.
-
-    Idempotent: rules that already exist (same PK) are left untouched,
-    so calling this on every startup is safe.
-    """
+    """Insert default rows for an entity type at a version; idempotent."""
     inserted = 0
     for rule in DEFAULT_POLICY_RULES:
         existing = await session.get(Policy, (version, entity_type, rule["rule_id"]))
@@ -185,13 +213,7 @@ async def get_rules(
 
 
 def rule_applies_to(rule: Policy, context: dict | None) -> bool:
-    """True if the rule's applies_when is satisfied by the context.
-
-    Matching is subset semantics: every key-value pair in applies_when
-    must be present and equal in the context. A rule with a null/empty
-    applies_when applies to every decision. A missing context key never
-    matches — silence is not consent.
-    """
+    """True if applies_when is a subset of context; empty applies always."""
     if not rule.applies_when:
         return True
     if not context:

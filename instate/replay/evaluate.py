@@ -1,16 +1,5 @@
-"""Golden-set evaluation — decision accuracy, measured (§11, build item 13).
-
-The golden set is a handful of scenarios with known-good outcomes. Each
-one runs the REAL pipeline (gates, taxonomy, hard-decline rule) with a
-SCRIPTED model — including deliberately bad proposals — and checks where
-the system actually landed.
-
-That is the point of the eval: the model is allowed to be wrong, and the
-measured claim is that the SYSTEM still lands on the right action. A
-hallucinated RETRY_NOW on a hard decline must not survive Gate-2; a
-ceilinged entity must never reach the model at all. Accuracy here is the
-system's, not the model's.
-"""
+"""Golden-set evaluation: scripted-model cases through the real pipeline.
+Measures system accuracy (gates + defaults), not model accuracy."""
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -54,7 +43,7 @@ class GoldenResult:
     detail: str = ""
 
 
-# The golden set — every gate in the system, exercised by name
+# Golden cases.
 GOLDEN_SET: list[GoldenCase] = [
     GoldenCase(
         name="insufficient_funds_schedules_payday_retry",
@@ -85,7 +74,7 @@ GOLDEN_SET: list[GoldenCase] = [
     GoldenCase(
         name="ceiling_escalates_with_zero_llm",
         failure_code="insufficient_funds",
-        # the model naively says retry — Gate-1 must stop it first
+        # Gate-1 must stop the naive retry.
         model_proposal={
             "action": ACTION_RETRY_NOW,
             "timing": "IMMEDIATE",
@@ -129,8 +118,7 @@ GOLDEN_SET: list[GoldenCase] = [
     GoldenCase(
         name="hard_decline_retry_is_blocked",
         failure_code="CARD_EXPIRED",
-        # THE bad-model case: a retry on an expired card is guaranteed
-        # to fail — Gate-2's hard-decline rule must veto it
+        # Gate-2 must veto retry on an expired card.
         model_proposal={
             "action": ACTION_RETRY_NOW,
             "timing": "IMMEDIATE",
@@ -180,11 +168,8 @@ async def evaluate_golden_set(
     now=None,
     cases: list[GoldenCase] | None = None,
 ) -> list[GoldenResult]:
-    """Run every golden case through the real pipeline; report pass/fail.
-
-    `reasoner_factory(case) -> Reasoner` — a fresh scripted model per case
-    (so per-case proposals and usage don't bleed). Unseeded tables are
-    seeded idempotently, so the evaluator is safe to call standalone.
+    """Run golden cases through the real pipeline; report pass/fail.
+    reasoner_factory(case) gives a fresh scripted model per case; tables are seeded idempotently.
     """
     now = now or datetime.now(UTC)
     await seed_default_policy(session)
@@ -264,7 +249,7 @@ async def evaluate_golden_set(
 
 
 def _static_reasoner(proposal: dict | None):
-    """A scripted model returning a fixed proposal (records usage)."""
+    """Scripted model returning a fixed proposal."""
 
     class _R:
         model_name = "scripted-golden"

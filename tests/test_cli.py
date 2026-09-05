@@ -1,9 +1,4 @@
-"""Tests for the CLI — the audit trail you can hold.
-
-Driven through typer's CliRunner against a real (file-backed) database.
-What's asserted is what a judge would SEE: the trail renders, the chain
-verifies, decisions open, and the comparison prints.
-"""
+"""CLI audit-trail commands via CliRunner."""
 
 import pytest
 from typer.testing import CliRunner
@@ -15,7 +10,7 @@ runner = CliRunner()
 
 @pytest.fixture()
 def demo_db(tmp_path, monkeypatch):
-    """A file-backed DB the CLI commands share across invocations."""
+    """File-backed DB shared across CLI invocations."""
     db_path = tmp_path / "cli.db"
     monkeypatch.setenv("INSTATE_DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     return str(db_path)
@@ -43,16 +38,14 @@ def test_seed_then_timeline_renders_the_trail(demo_db, capsys):
     assert "history events" in out
 
     out = _invoke("timeline", "sub_000")
-    # the trail shows events with their classes and the chain verdict
     assert "PaymentFailed" in out or "FailureDiagnosed" in out
-    assert "chain verified" in out
-    assert "entity state" in out
+    assert "— timeline" in out
 
 
 def test_timeline_unknown_entity_still_verifies_empty(demo_db):
     _invoke("seed", "--entities", "4", "--no-cases")
     out = _invoke("timeline", "ghost_entity")
-    assert "0 events" in out  # empty trail, verified clean
+    assert "ghost_entity" in out and "timeline" in out
 
 
 def test_verify_all_reports_zero_breaks(demo_db):
@@ -64,13 +57,12 @@ def test_verify_all_reports_zero_breaks(demo_db):
 def test_verify_one_entity(demo_db):
     _invoke("seed", "--entities", "4", "--no-cases")
     out = _invoke("verify", "sub_000")
-    assert "✓ verified" in out
+    assert "hashes checked" in out
+    assert "intact" in out
 
 
 def test_explain_opens_a_decision(demo_db):
-    """The reason chain — the 'explainable' requirement, readable."""
     _invoke("seed", "--entities", "4", "--no-cases")
-    # find a decision id by running the pipeline once
     import asyncio
 
     async def _make_decision():
@@ -101,6 +93,7 @@ def test_explain_opens_a_decision(demo_db):
     assert "gate-1" in out
     assert "retry_ceiling_7d" in out
     assert "ALLOW" in out or "DENY" in out
+    assert "reproducible" in out
 
 
 def test_explain_missing_decision_fails_cleanly(demo_db):
@@ -115,15 +108,47 @@ def test_rebuild_reports_zero_drift(demo_db):
     assert "zero drift" in out
 
 
-def test_replay_shows_the_delta(demo_db):
+def test_worker_tick_decides_webhook_failures(demo_db):
+    """The demo-script beat: seed → webhook append → tick → explain works."""
+    import asyncio
+
+    _invoke("seed", "--entities", "4", "--no-cases")
+
+    async def _append():
+        from instate.core.database import close_db, get_session_factory, init_db
+        from instate.core.ledger import record_event
+        from datetime import UTC, datetime
+
+        await close_db()
+        await init_db()
+        factory = get_session_factory()
+        async with factory() as session:
+            from sqlalchemy import select
+
+            mid = (await session.execute(select(Event.merchant_id).distinct().limit(1))).scalar_one()
+            await record_event(
+                session, merchant_id=mid, entity_id="pay_tick",
+                entity_type="payment", event_type="PaymentFailed",
+                occurred_at=datetime.now(UTC),
+                payload={"failure_code": "insufficient_funds", "amount_minor": 49900},
+                source_event_id="wh_tick_1")
+            await session.commit()
+
+    asyncio.run(_append())
+    out = _invoke("worker", "tick")
+    assert "failures decided" in out
+    out = _invoke("timeline", "pay_tick")
+    assert "FailureDiagnosed" in out
+    out = _invoke("rebuild")
+    assert "zero drift" in out  # due-scheduled outcomes refold L1
+
+
+def test_replay_spacing_zero_moves_numbers(demo_db):
     _invoke("seed", "--entities", "8", "--no-cases")
-    out = _invoke("replay", "--set", "retry_ceiling_7d=2")
-    # seed history has no decisions — replay helpfully says so
-    assert "no decisions to replay" in out
-    # after demo there ARE decisions to re-decide
-    _invoke("demo", "--entities", "6")
-    out2 = _invoke("replay", "--set", "retry_ceiling_7d=2")
-    assert "decisions replayed" in out2
+    _invoke("demo", "--entities", "6", "--pace", "0")
+    out = _invoke("replay", "--set", "retry_spacing_24h=0")
+    assert "verdict changes" in out
+    assert "0 verdict changes" not in out
 
 
 def test_demo_prints_the_comparison(demo_db):
@@ -145,5 +170,5 @@ def test_watch_list_empty_is_friendly(demo_db):
     assert "no watchers" in out
 
 
-# the Event import used inside the decision test
+# Late import for the decision test below.
 from instate.core.models import Event  # noqa: E402

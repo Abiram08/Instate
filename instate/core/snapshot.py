@@ -1,13 +1,4 @@
-"""L1 snapshots — checkpoint for sublinear rebuild (§15).
-
-The demo's `rebuild()` replays from genesis (fine at ~300 events). At
-production scale that becomes linear in total history. Snapshots fix it:
-
-- `create_snapshot(session, merchant, entity)` — persist the current
-  EntityState + its watermark.
-- `rebuild_incremental(session)` — replay only events *after* the
-  newest snapshot per entity, same "L1 is derived" guarantee.
-"""
+"""L1 snapshots: watermarked checkpoints for incremental rebuild (§15)."""
 
 
 from sqlalchemy import delete, select
@@ -47,7 +38,6 @@ async def rebuild_incremental(session: AsyncSession) -> dict:
     """Rebuild using the newest snapshot per entity as starting point."""
     from instate.core.projection import apply_event
 
-    # newest snapshot per (merchant, entity)
     snaps = await session.execute(select(L1Snapshot))
     latest: dict[tuple, L1Snapshot] = {}
     for s in snaps.scalars():
@@ -60,7 +50,6 @@ async def rebuild_incremental(session: AsyncSession) -> dict:
 
         return await rebuild(session)
 
-    # restore snapshots into L1
     await session.execute(delete(EntityState))
     await session.flush()
     for snap in latest.values():
@@ -85,7 +74,6 @@ async def rebuild_incremental(session: AsyncSession) -> dict:
         )
     await session.flush()
 
-    # replay only after watermark
     folded = 0
     for snap in latest.values():
         evts = await session.execute(
@@ -112,7 +100,6 @@ async def rebuild_incremental(session: AsyncSession) -> dict:
         state = await session.get(EntityState, (mid, eid))
         if state is not None:
             continue
-        # brand new entity after last snapshot
         first = await session.execute(
             select(Event)
             .where(Event.merchant_id == mid, Event.entity_id == eid)

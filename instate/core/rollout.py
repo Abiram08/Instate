@@ -13,9 +13,7 @@ async def create_canary_version(
     overrides: dict[str, int],
     canary_merchants: list,
 ) -> int:
-    """Copy current active version to v+1 with overrides; tag canary
-    merchants in a side table (here: just return the version — the
-    routing layer checks merchant in canary list)."""
+    """Copy active version to v+1 with overrides."""
     from sqlalchemy import func
 
     v = (await session.execute(select(func.max(Policy.version)).where(Policy.entity_type == entity_type))).scalar_one() or 0

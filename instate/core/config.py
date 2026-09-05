@@ -6,11 +6,7 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Config:
-    """Application configuration.
-
-    Supports both PostgreSQL (production) and SQLite (dev/test).
-    The database URL controls which backend is used.
-    """
+    """Application configuration."""
 
     database_url: str = field(
         default_factory=lambda: os.environ.get(

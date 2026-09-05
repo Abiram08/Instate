@@ -1,16 +1,6 @@
-"""Razorpay adapter — the money boundary (§6 step 5).
-
-`PaymentGateway` is the protocol the agent depends on; `RazorpayGateway`
-is the test-mode client. The gateway is ONLY called after the outbox
-intent is durably committed, and every call carries an idempotency key —
-a crash mid-action is reconciled, never doubled (§10).
-
-The HTTP client (httpx) is imported lazily at call sites where possible;
-the protocol means tests inject fakes and the core never sees the SDK.
-
-Explicit timeout (10s) and bounded retries (≤3, exponential backoff with
-jitter, honoring Retry-After) live here — the outbound rules of the ops
-layer (§10) start inside the only adapter that touches money.
+"""Razorpay test-mode gateway.
+Called only after outbox intent is committed; every call carries an idempotency key.
+Timeout 10s, ≤3 attempts with backoff+jitter honoring Retry-After.
 """
 
 import asyncio
@@ -20,7 +10,9 @@ from typing import Protocol
 import httpx
 
 from instate.core.models import (
+    ACTION_CHECK_METHOD_UPDATED,
     ACTION_REQUEST_PAYMENT_METHOD,
+    ACTION_RETRY_BACKUP_METHOD,
     ACTION_RETRY_NOW,
     ACTION_RETRY_SCHEDULED,
     ACTION_SEND_PAYMENT_LINK,
@@ -33,15 +25,7 @@ MAX_ATTEMPTS = 3
 
 
 class GatewayResponse:
-    """What an execution attempt returns — a fact, not an exception.
-
-    status: "completed" (money/link done) | "failed" (declined — a real
-    outcome, write it to the ledger) | "unknown" (timeout/5xx — the
-    intent stands; reconciliation resolves it)
-
-    `amount_minor` rides along on completed money attempts — the outcome
-    events need it for the recovered-money metric.
-    """
+    """Execution result: completed | failed | unknown (reconciled later)."""
 
     def __init__(
         self,
@@ -49,11 +33,13 @@ class GatewayResponse:
         provider_ref: str | None = None,
         detail: str = "",
         amount_minor: int | None = None,
+        data: dict | None = None,
     ):
         self.status = status
         self.provider_ref = provider_ref
         self.detail = detail
         self.amount_minor = amount_minor
+        self.data = data or {}
 
     def __repr__(self) -> str:
         return f"GatewayResponse({self.status!r}, ref={self.provider_ref!r})"
@@ -72,7 +58,7 @@ class PaymentGateway(Protocol):
     ) -> GatewayResponse: ...
 
     async def lookup(self, idempotency_key: str) -> GatewayResponse | None:
-        """Query Razorpay by our stored key (the boot reconciler)."""
+        """Query by stored key for the boot reconciler."""
         ...
 
 
@@ -126,27 +112,49 @@ class RazorpayGateway:
                     body=payload or {},
                     headers=headers,
                 )
+            if action == ACTION_RETRY_BACKUP_METHOD:
+                # Same endpoint with the stored backup instrument.
+                return await self._post(
+                    f"/payments/{entity_id}/retry",
+                    body={
+                        "instrument": "backup",
+                        "use_backup_instrument": True,
+                        "zero_customer_action": True,
+                        **(payload or {}),
+                    },
+                    headers=headers,
+                )
             if action == ACTION_RETRY_SCHEDULED:
-                # Never hits the wire here — scheduling is local (the
-                # outbox); the due scan executes it later as a RETRY_NOW.
+                # Scheduling is local; the due scan executes it later as RETRY_NOW.
                 return GatewayResponse(
                     "completed",
                     provider_ref=idempotency_key,
                     detail="scheduled locally",
                 )
+            if action == ACTION_CHECK_METHOD_UPDATED:
+                # Read-only probe; method_updated=True unblocks retries without burning an attempt.
+                return await self._get_method_status(entity_id, headers=headers)
             return GatewayResponse("failed", detail=f"unsupported action {action!r}")
-        except Exception as exc:  # noqa: BLE001 — the boundary converts every
-            # failure into a fact; the ledger decides what facts mean
+        except Exception as exc:  # noqa: BLE001 — failures become facts for the ledger
             return GatewayResponse("unknown", detail=str(exc))
 
-    async def lookup(self, idempotency_key: str) -> GatewayResponse | None:
-        """Probe Razorpay for work we may or may not have completed.
+    async def _get_method_status(self, entity_id: str, headers: dict) -> GatewayResponse:
+        """Read-only method probe; never moves money or counts as an attempt."""
+        async with httpx.AsyncClient(
+            base_url=self._base_url, auth=self._auth, timeout=TIMEOUT_SECONDS
+        ) as client:
+            resp = await client.get(f"/payments/{entity_id}", headers=headers)
+            if resp.status_code != 200:
+                return GatewayResponse("failed", detail=f"method probe HTTP {resp.status_code}")
+            body = resp.json() if resp.content else {}
+            return GatewayResponse(
+                "completed",
+                provider_ref=body.get("id"),
+                data={"method_updated": bool(body.get("method_updated", False))},
+            )
 
-        Razorpay's idempotency replay returns the original response for a
-        retried POST carrying the same key; for the demo reconciler we
-        probe payment_links by reference. Production keeps a provider_ref
-        on the intent and GETs it directly — same protocol, better keys.
-        """
+    async def lookup(self, idempotency_key: str) -> GatewayResponse | None:
+        """Probe for prior work by idempotency key."""
         try:
             async with httpx.AsyncClient(
                 base_url=self._base_url, auth=self._auth, timeout=TIMEOUT_SECONDS
@@ -161,9 +169,7 @@ class RazorpayGateway:
             return None
 
     async def _post(self, path: str, *, body: dict, headers: dict) -> GatewayResponse:
-        """POST with explicit timeout, ≤3 attempts, backoff + jitter,
-        honoring Retry-After (§10). A 4xx (other than 429) is a real,
-        non-retryable answer — a fact for the ledger, not a retry loop."""
+        """POST with timeout, ≤3 attempts, backoff+jitter honoring Retry-After. 4xx (except 429) is non-retryable."""
         last_detail = ""
         retry_after = 0.0
         async with httpx.AsyncClient(

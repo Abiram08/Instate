@@ -1,16 +1,6 @@
-"""Instate seed — deterministic synthetic history + fresh failure batches.
-
-Architecture §13 build item 12: ~300 events across ~30 entities — sparse
-data makes retrieval look fake, so the density matters. Everything is
-seeded RNG (same seed → byte-identical history), so the baseline and the
-Instate-backed agent can run over IDENTICAL batches — the fair comparison
-the demo is built on (§11: "fair, not a strawman").
-
-Seven archetypes cycle across entities, each a real collections pattern:
-recovered-by-retry, promise kept, promise broken, method updater,
-escalated (fraud), at-ceiling (open), still-open, plus two thin-consumer
-checkout entities. A slice of recovered entities takes a refund — the
-RecoveryReversed events the net-money metric exists for.
+"""Deterministic synthetic history and failure batches (seeded RNG).
+Same seed → identical history, so baseline and agent run over identical batches.
+Covers recovery, promise, escalation, and ceiling patterns.
 """
 
 import random
@@ -53,6 +43,7 @@ async def _emit(
     occurred_at: datetime,
     payload: dict | None = None,
     source_event_id: str | None = None,
+    channel: str | None = None,
 ) -> Event:
     event = await record_event(
         session,
@@ -63,6 +54,7 @@ async def _emit(
         occurred_at=occurred_at,
         payload=payload,
         source_event_id=source_event_id,
+        channel=channel,
     )
     return event
 
@@ -74,9 +66,7 @@ async def _mark_diagnosed(
     root_cause: str,
     at: datetime,
 ) -> None:
-    """Append the FailureDiagnosed marker for a historical failure — the
-    drain matches on trigger_event_id, so marked failures are never
-    re-processed as fresh work."""
+    """Append FailureDiagnosed marker; drain skips marked failures via trigger_event_id."""
     await _emit(
         session,
         merchant_id,
@@ -94,7 +84,7 @@ async def _mark_diagnosed(
 
 
 # ---------------------------------------------------------------------------
-# History — the memory the demo's agents are judged against
+# History
 # ---------------------------------------------------------------------------
 
 ARCHETYPE_CYCLE = [
@@ -105,6 +95,8 @@ ARCHETYPE_CYCLE = [
     "at_ceiling",
     "promise_breaker",
     "still_open",
+    "backup_routed",  # backup instrument recovery, zero customer action
+    "whatsapp_recovered",  # WhatsApp-first contact → recovery (demo-visible)
     "recovered_retry",  # weighted: recoveries should be common
     "still_open",
     "escalated",
@@ -119,12 +111,8 @@ async def seed_history(
     seed: int = 42,
     now: datetime | None = None,
 ) -> dict:
-    """Write `entities` entities' synthetic history and fold it.
-
-    Every historical PaymentFailed gets a FailureDiagnosed marker — the
-    drain matches on trigger_event_id, so seeded history is never
-    re-processed as fresh work. Returns stats {entities, events,
-    checkouts}; deterministic per seed.
+    """Write `entities` synthetic histories and fold; deterministic per seed.
+    Returns {entities, events, checkouts}; history is marked diagnosed so the drain skips it.
     """
     now = now or datetime.now(UTC)
     rng = random.Random(seed)
@@ -136,7 +124,6 @@ async def seed_history(
     recovered_seen = 0
 
     async def start_case(entity_id: str, code: str, days_back: float) -> Event:
-        """A historical failure + its diagnosis marker (2 events)."""
         nonlocal event_count
         failed = await _emit(
             session,
@@ -384,7 +371,43 @@ async def seed_history(
             )
             event_count += 3
 
-        else:  # still_open — follow-ups make the history realistic (and fat)
+        elif archetype == "backup_routed":
+            amt = amount()
+            await start_case(entity_id, "CARD_EXPIRED", 12)
+            await _emit(
+                session, merchant_id, entity_id, n, "PaymentMethodChanged",
+                _days_ago(now, 11), {"via": "backup_on_file"},
+            )
+            await _emit(
+                session, merchant_id, entity_id, n, "RetryAttempted",
+                _days_ago(now, 10), {"success": True, "via": "backup", "zero_customer_action": True},
+            )
+            await _emit(
+                session, merchant_id, entity_id, n, "RetrySucceeded",
+                _days_ago(now, 10), {"amount_minor": amt, "via": "backup"},
+            )
+            event_count += 3
+
+        elif archetype == "whatsapp_recovered":
+            amt = amount()
+            await start_case(entity_id, "insufficient_funds", 9)
+            await _emit(
+                session, merchant_id, entity_id, n, "CustomerContacted",
+                _days_ago(now, 8), {"channel": "whatsapp"},
+                source_event_id=f"{tag}_{entity_id}_wa", channel="whatsapp",
+            )
+            await _emit(
+                session, merchant_id, entity_id, n, "PaymentLinkSent",
+                _days_ago(now, 8), {"channel": "whatsapp"},
+                source_event_id=f"{tag}_{entity_id}_walink", channel="whatsapp",
+            )
+            await _emit(
+                session, merchant_id, entity_id, n, "RetrySucceeded",
+                _days_ago(now, 6), {"amount_minor": amt},
+            )
+            event_count += 3
+
+        else:  # still_open
             await start_case(entity_id, "insufficient_funds", 4)
             await _emit(
                 session,
@@ -450,7 +473,7 @@ async def seed_history(
 
 
 # ---------------------------------------------------------------------------
-# The fresh batch — what both agents are run over
+# Fresh batch
 # ---------------------------------------------------------------------------
 
 
@@ -466,15 +489,9 @@ async def generate_failure_batch(
     codes: list[str] | None = None,
 ):
     """Append PaymentFailed events and return them, in order.
-
-    Default: 10 fresh entities with the standard code cycle.
-    `entity_ids`/`codes` override — the comparison runner uses them to
-    aim failures at entities with history (at-ceiling, open promises)
-    AND at fresh ones, which is what makes the gates fire. With
-    `entity_ids` given and `count` omitted, count = len(entity_ids).
-
-    Deterministic per seed: the baseline and the Instate-backed agent
-    each receive an IDENTICAL batch."""
+    Defaults to 10 fresh entities; `entity_ids`/`codes` override
+    (count defaults to len(entity_ids)). Deterministic per seed.
+    """
     now = now or datetime.now(UTC)
     rng = random.Random(seed)
     n = len(entity_ids) if (entity_ids is not None and count is None) else (count or 10)

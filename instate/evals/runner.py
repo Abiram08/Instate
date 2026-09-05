@@ -1,4 +1,4 @@
-"""Continuous eval — scheduled runs, alert on regression (§15)."""
+"""Continuous eval: scheduled runs, alert on regression."""
 
 import asyncio
 

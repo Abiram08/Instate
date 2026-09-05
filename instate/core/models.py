@@ -1,16 +1,7 @@
-"""Instate models — L0 (events ledger), L1 (entity_state projection),
-L2 (policy) and the decisions audit object.
+"""L0 events ledger, L1 entity state, L2 policy, and decisions audit. §1-6.
 
-Design notes (architecture.md §1-6):
-- L0 is append-only: no UPDATE, no DELETE, ever.
-- The hash chain is per-entity: prev_hash links to the previous event
-  for the SAME (merchant_id, entity_id), not a global chain.
-- Bi-temporal: occurred_at (valid time) vs recorded_at (transaction time).
-- Windowed counters are NOT in L1 — they're computed at gate-check
-  as indexed L0 counts (see projection.py:get_windowed_count).
-- L2 policy is declarative versioned rows; every rule cites its source.
-- A gate never returns a bare boolean — it returns the reason chain.
-"""
+L0 is append-only: no UPDATE or DELETE. Hash chain is per (merchant_id, entity_id).
+Windowed counters are computed at gate-check, not stored in L1."""
 
 import json
 from datetime import UTC, datetime
@@ -33,8 +24,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from instate.core.crypto import EncryptedJSONType
 
-# BigInteger PK that works on both backends:
-# PostgreSQL: BIGSERIAL, SQLite: INTEGER (autoincrement requires INTEGER PRIMARY KEY)
+# BigInteger PK that works on both backends (BIGSERIAL on PG, INTEGER on SQLite)
 BigIntPK = BigInteger().with_variant(Integer(), "sqlite")
 
 
@@ -90,29 +80,15 @@ class UTCTimestamp(TypeDecorator[datetime]):
         return value.astimezone(UTC)
 
 
-# BigInteger primary key works on both backends
-# (SQLite maps autoincrement BIGINT to INTEGER internally; SQLAlchemy handles this)
-
-
-# ---------------------------------------------------------------------------
-# Base
-# ---------------------------------------------------------------------------
-
-
 class Base(DeclarativeBase):
     pass
 
 
-# ---------------------------------------------------------------------------
-# L0: The Ledger (§1 of architecture.md)
-# ---------------------------------------------------------------------------
+# L0: The Ledger (§1)
 
 
 class Event(Base):
-    """An immutable, hash-chained event in the ledger.
-
-    Append-only. The application NEVER issues UPDATE or DELETE on this table.
-    """
+    """Immutable hash-chained ledger event. Append-only: no UPDATE or DELETE."""
 
     __tablename__ = "events"
 
@@ -125,13 +101,13 @@ class Event(Base):
     recorded_at: Mapped[datetime] = mapped_column(
         UTCTimestamp, nullable=False, default=lambda: datetime.now(UTC)
     )
-    # Encrypted at rest when INSTATE_ENCRYPTION_KEY is set, transparent
-    # otherwise (behaves exactly like JSONType). The chain hashes the
-    # PLAINTEXT payload_hash, so encryption can never break verification.
+    # Encrypted at rest when INSTATE_ENCRYPTION_KEY is set. Chain hashes plaintext payload_hash.
     payload: Mapped[dict[str, Any] | None] = mapped_column(EncryptedJSONType(), nullable=True)
     payload_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     source_event_id: Mapped[str | None] = mapped_column(Text, nullable=True, unique=True)
     decision_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Denormalized from payload["channel"] for indexed per-channel counts. None for non-contact events.
+    channel: Mapped[str | None] = mapped_column(Text, nullable=True)
     prev_hash: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
@@ -144,13 +120,18 @@ class Event(Base):
 
 Index("idx_events_merchant_entity_occurred", Event.merchant_id, Event.entity_id, Event.occurred_at)
 Index("idx_events_recorded_at", Event.recorded_at)
+Index(
+    "idx_events_merchant_entity_channel_occurred",
+    Event.merchant_id,
+    Event.entity_id,
+    Event.channel,
+    Event.occurred_at,
+)
 
 
-# ---------------------------------------------------------------------------
-# L1: The Projection (§2 of architecture.md)
-# ---------------------------------------------------------------------------
+# L1: The Projection (§2)
 
-# State machine positions (architecture.md §6):
+# State machine positions (§6):
 #   ACTIVE → DIAGNOSED → RETRY_SCHEDULED → AWAITING_PROMISE → ESCALATED → RECOVERED
 #                                                                      ↘ WRITTEN_OFF
 STATUS_ACTIVE = "ACTIVE"
@@ -160,6 +141,8 @@ STATUS_AWAITING_PROMISE = "AWAITING_PROMISE"
 STATUS_ESCALATED = "ESCALATED"
 STATUS_RECOVERED = "RECOVERED"
 STATUS_WRITTEN_OFF = "WRITTEN_OFF"
+# PAUSED parks inattention failures; no auto money moves while parked.
+STATUS_PAUSED = "PAUSED"
 
 VALID_STATUSES = {
     STATUS_ACTIVE,
@@ -169,17 +152,14 @@ VALID_STATUSES = {
     STATUS_ESCALATED,
     STATUS_RECOVERED,
     STATUS_WRITTEN_OFF,
+    STATUS_PAUSED,
 }
+
+TERMINAL_STATUSES = {STATUS_RECOVERED, STATUS_WRITTEN_OFF}
 
 
 class EntityState(Base):
-    """Derived state for an entity — a pure fold over L0.
-
-    Holds only what folds cleanly: the state-machine position and
-    point-in-time scalars. Windowed counters (retry_count_7d, contacts_24h)
-    are deliberately NOT here — they're computed at gate-check as
-    indexed L0 counts (projection.py:get_windowed_count).
-    """
+    """Derived L1 state: fold over L0. Windowed counters live in L0 counts, not here."""
 
     __tablename__ = "entity_state"
 
@@ -191,6 +171,11 @@ class EntityState(Base):
     last_failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     open_ptp_due_at: Mapped[datetime | None] = mapped_column(UTCTimestamp, nullable=True)
     amount_at_risk_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Customer timezone (IANA). Set from event payloads; invalid names are ignored.
+    timezone: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Card expiry from CardExpiring events for pre-expiry watchers.
+    card_exp_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    card_exp_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_event_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
     def __repr__(self) -> str:
@@ -201,13 +186,10 @@ class EntityState(Base):
 
 
 def new_merchant_id() -> UUID:
-    """Generate a merchant UUID (for seeding/testing)."""
     return uuid4()
 
 
-# ---------------------------------------------------------------------------
-# L2: Policy (§3 of architecture.md)
-# ---------------------------------------------------------------------------
+# L2: Policy (§3)
 
 # Gate verdicts. A policy row can only DENY or REQUIRE_HUMAN — it can never
 # *force* an action. ALLOW is computed (no rule fired), never stored in L2.
@@ -218,17 +200,7 @@ GATE_VERDICTS = {VERDICT_DENY, VERDICT_REQUIRE_HUMAN}
 
 
 class Policy(Base):
-    """A declarative, versioned policy rule — what is allowed (§3).
-
-    Rows, not code. Every rule cites its source (regulation or internal
-    policy) so compliance questions have a concrete answer.
-
-    Two rule shapes:
-    - Counter rules (metric is set): observed := indexed L0 count over
-      `window_seconds`; fires when observed >= limit_value.
-    - Context rules (metric is None): fire purely on `applies_when`
-      matching the decision context (e.g. {"root_cause": "fraud_block"}).
-    """
+    """Declarative versioned policy rule (§3). Counter rules use metric+window; context rules match applies_when."""
 
     __tablename__ = "policy"
 
@@ -249,12 +221,9 @@ class Policy(Base):
         )
 
 
-# ---------------------------------------------------------------------------
-# Decisions — the audit object (§5 of architecture.md)
-# ---------------------------------------------------------------------------
+# Decisions — the audit object (§5)
 
-# The closed action space (§6 taxonomy). The model cannot invent an action;
-# the worst it can do is pick a legal one badly — Gate-2 checks that pick.
+# Closed action space (§6): model picks only from LEGAL_ACTIONS.
 ACTION_RETRY_NOW = "RETRY_NOW"
 ACTION_RETRY_SCHEDULED = "RETRY_SCHEDULED"
 ACTION_SEND_PAYMENT_LINK = "SEND_PAYMENT_LINK"
@@ -262,6 +231,10 @@ ACTION_UPDATE_MANDATE = "UPDATE_MANDATE"
 ACTION_REQUEST_PAYMENT_METHOD = "REQUEST_PAYMENT_METHOD"
 ACTION_AWAIT_PROMISE = "AWAIT_PROMISE"
 ACTION_ESCALATE_HUMAN = "ESCALATE_HUMAN"
+# Retry on a different instrument already on file.
+ACTION_RETRY_BACKUP_METHOD = "RETRY_BACKUP_METHOD"
+# Read-only check for an updated payment method since failure.
+ACTION_CHECK_METHOD_UPDATED = "CHECK_METHOD_UPDATED"
 
 LEGAL_ACTIONS = {
     ACTION_RETRY_NOW,
@@ -271,6 +244,8 @@ LEGAL_ACTIONS = {
     ACTION_REQUEST_PAYMENT_METHOD,
     ACTION_AWAIT_PROMISE,
     ACTION_ESCALATE_HUMAN,
+    ACTION_RETRY_BACKUP_METHOD,
+    ACTION_CHECK_METHOD_UPDATED,
 }
 
 # Actions that reach the customer (frequency caps + DNC apply to these)
@@ -281,15 +256,26 @@ CUSTOMER_CONTACT_ACTIONS = {
     ACTION_AWAIT_PROMISE,
 }
 
-# Actions that attempt money (retry caps apply to these)
-MONEY_ATTEMPT_ACTIONS = {ACTION_RETRY_NOW, ACTION_RETRY_SCHEDULED}
+# Actions that attempt money (retry caps apply to these). A backup-method
+# retry IS a money attempt — it counts toward the same budgets.
+MONEY_ATTEMPT_ACTIONS = {ACTION_RETRY_NOW, ACTION_RETRY_SCHEDULED, ACTION_RETRY_BACKUP_METHOD}
+
+# Contact channels; free-form strings are rejected at the gate.
+ALLOWED_CHANNELS = {
+    "email",
+    "sms",
+    "push",
+    "payment_link",
+    "whatsapp",
+    "mandate_update",
+    "message",
+    "upi",
+}
 
 # Confidence below this routes to a human at Gate-2
 CONFIDENCE_FLOOR = 0.6
 
-# Hard declines (§6, Stripe lesson): a retry is guaranteed to fail until a
-# NEW payment method exists. Scheduled retries may stay queued, but they
-# execute only after a PaymentMethodChanged event unblocks the path.
+# Hard declines (§6): retries execute only after PaymentMethodChanged.
 HARD_DECLINE_ROOT_CAUSES = {
     "card_expired",
     "lost_card",
@@ -300,13 +286,7 @@ HARD_DECLINE_ROOT_CAUSES = {
 
 
 class Decision(Base):
-    """The audit record that ties L0-L2 together (§5 of architecture.md).
-
-    A gate never returns true/false — it returns the reason chain, and the
-    chain is persisted here. `policy_version` records which rules were in
-    force when the call was made; `inputs_hash`/`prompt_text` make the
-    decision reproducible rather than merely logged.
-    """
+    """Audit record tying L0-L2 together (§5). Stores reason chains and policy_version for reproducibility."""
 
     __tablename__ = "decisions"
 
@@ -335,18 +315,11 @@ class Decision(Base):
         return f"Decision(id={self.id}, entity={self.entity_id!r}, root_cause={self.root_cause!r})"
 
 
-# ---------------------------------------------------------------------------
-# Scheduled actions — the durable queue (§14 of architecture.md)
-# ---------------------------------------------------------------------------
+# Scheduled actions — the durable queue (§14)
 
 
 class ScheduledAction(Base):
-    """A future action, persisted (§14). Do NOT reach for Celery or Temporal —
-    the ledger is the durable queue; this table is its ticking index.
-
-    `executed_at` is set when the action fires, so a due scan never
-    double-executes; the `idempotency_key` protects the execution itself.
-    """
+    """Future action persisted as durable queue index (§14). executed_at prevents double-execution."""
 
     __tablename__ = "scheduled_actions"
 
@@ -371,19 +344,13 @@ class ScheduledAction(Base):
         )
 
 
-# ---------------------------------------------------------------------------
-# Diagnosis map + action taxonomy — versioned data, not code (§6, build item 5)
-# ---------------------------------------------------------------------------
+# Diagnosis map + action taxonomy as versioned data (§6)
 
 ROOT_CAUSE_UNKNOWN = "UNKNOWN"
 
 
 class DiagnosisRule(Base):
-    """Razorpay failure code → root-cause class, as versioned data.
-
-    The map lives in a table (not a dict in code) so it is auditable and
-    updatable without a deploy — an L2-style fact, evaluated at a version.
-    """
+    """Failure code → root-cause map as versioned rows. Auditable without a deploy."""
 
     __tablename__ = "diagnosis_rules"
 
@@ -397,12 +364,7 @@ class DiagnosisRule(Base):
 
 
 class TaxonomyRule(Base):
-    """Root cause → default action, keyed to the decline reason (§6).
-
-    `deterministic=True` marks the fixed-action routes (fraud_block,
-    mandate_inactive, UNKNOWN) that skip the model entirely: the policy
-    default IS the decision, zero tokens.
-    """
+    """Root cause → default action (§6). deterministic=True skips the model."""
 
     __tablename__ = "taxonomy_rules"
 
@@ -419,22 +381,33 @@ class TaxonomyRule(Base):
         )
 
 
-# ---------------------------------------------------------------------------
-# L3: Precedent (§4 of architecture.md) — the ONLY tier that embeds
-# ---------------------------------------------------------------------------
+class DunningSequence(Base):
+    """Per-root-cause outreach step as versioned data. Advisory to the model; never gates."""
+
+    __tablename__ = "dunning_sequences"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    root_cause: Mapped[str] = mapped_column(Text, primary_key=True)
+    step_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    channel: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delay_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+
+    def __repr__(self) -> str:
+        return (
+            f"DunningSequence(v{self.version}, {self.root_cause!r}#{self.step_index} → "
+            f"{self.action!r} via {self.channel!r})"
+        )
+
+
+# L3: Precedent (§4)
 
 EMBEDDING_DIMS = 1024
 
 
 class Case(Base):
-    """A resolved case summary: {situation → action → outcome} (§4).
-
-    Embedded case SUMMARIES, never raw events; resolved cases only (an
-    unresolved case has nothing to teach). The embedding is stored as a
-    JSON vector — cross-backend by construction; on production Postgres
-    this becomes a pgvector column with an HNSW index (§15 backlog) and
-    ranking moves to the `<=>` operator.
-    """
+    """Resolved case summary {situation → action → outcome} (§4). Embedded summaries only."""
 
     __tablename__ = "cases"
 
@@ -457,18 +430,11 @@ class Case(Base):
         )
 
 
-# ---------------------------------------------------------------------------
-# Watchers — memory that initiates (§2, Context.dev monitor pattern)
-# ---------------------------------------------------------------------------
+# Watchers (§2)
 
 
 class Watcher(Base):
-    """A condition over L1/L2 facts that pushes a signed webhook when tripped.
-
-    Watchers fire on integers and timestamps — never on embeddings (the
-    same trust rule as the gates). Cooldown prevents re-firing spam; the
-    tick loop owns the checks.
-    """
+    """Condition over L1/L2 facts pushing a signed webhook. Integers/timestamps only, never embeddings."""
 
     __tablename__ = "watchers"
 
@@ -493,14 +459,11 @@ class Watcher(Base):
         return f"Watcher({self.id}, {self.condition}, target={self.target_url!r})"
 
 
-# ---------------------------------------------------------------------------
-# L1 Snapshots — checkpoint for sublinear rebuild (§15)
-# ---------------------------------------------------------------------------
+# L1 Snapshots — checkpoint for incremental rebuild (§15)
 
 
 class L1Snapshot(Base):
-    """A watermarked checkpoint of L1. Rebuild replays only since the
-    last snapshot — same guarantee, sublinear cost."""
+    """Watermarked L1 checkpoint. Rebuild replays only since the last snapshot."""
 
     __tablename__ = "l1_snapshots"
 
@@ -520,9 +483,7 @@ class L1Snapshot(Base):
 Index("idx_l1snap_merchant_entity", L1Snapshot.merchant_id, L1Snapshot.entity_id)
 
 
-# ---------------------------------------------------------------------------
-# HITL Queue — working escalation loop (§15)
-# ---------------------------------------------------------------------------
+# HITL Queue (§15)
 
 
 class HitlTask(Base):
@@ -554,9 +515,7 @@ class HitlTask(Base):
         return f"HitlTask({self.id}, {self.entity_id}:{self.status})"
 
 
-# ---------------------------------------------------------------------------
-# Archive anchors — chain-walkable cold storage (§15)
-# ---------------------------------------------------------------------------
+# Archive anchors — cold storage (§15)
 
 
 class ArchiveAnchor(Base):

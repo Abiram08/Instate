@@ -1,12 +1,5 @@
-"""Tests for the gates — Gate-1 (evaluate) and Gate-2 (check_proposal).
-
-The correctness-critical edges (build-order item 4: "unit-test the
-stopping-rule boundaries hard"): at-limit vs below-limit, window edges,
-entity isolation, dedupe not double-counting, context rules, the
-closed action enum, state-machine legality, DNC, and the confidence
-floor. Every gate result carries its reason chain — the evidence,
-not a boolean.
-"""
+"""Gate-1 (evaluate) and Gate-2 (check_proposal) boundary tests.
+Reason chains are the evidence, not a boolean."""
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -111,10 +104,7 @@ async def test_gate1_allows_empty_history(session: AsyncSession):
 
 
 async def test_gate1_denies_at_ceiling(session: AsyncSession):
-    """THE boundary: observed == limit (3 retries in 7d) → DENY.
-
-    An entity at its ceiling never reaches the model — zero tokens.
-    """
+    """At ceiling (3/7d) → DENY before the model."""
     merchant = make_merchant_id()
     await seed_policy(session)
     await seed_events(
@@ -142,11 +132,7 @@ async def test_gate1_denies_at_ceiling(session: AsyncSession):
 
 
 async def test_gate1_allows_below_ceiling(session: AsyncSession):
-    """2 of 3 retries → ALLOW (the boundary holds on the safe side).
-
-    The attempts sit at 6 and 5 days back: inside the 7d ceiling window,
-    clear of the 24h spacing window — isolating the ceiling boundary.
-    """
+    """Below ceiling (2/3) → ALLOW; attempts outside 24h spacing window."""
     merchant = make_merchant_id()
     await seed_policy(session)
     await seed_events(
@@ -222,8 +208,7 @@ async def test_gate1_entity_isolation(session: AsyncSession):
 
 
 async def test_gate1_dedupe_never_double_counts(session: AsyncSession):
-    """A webhook redelivery is inert — it cannot push an entity over its
-    ceiling by counting twice."""
+    """Redelivery is inert; cannot push entity over ceiling."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -298,8 +283,7 @@ async def test_gate1_contact_cap_fires_for_contact_actions(session: AsyncSession
 
 
 async def test_gate1_retry_caps_dont_fire_for_contacts(session: AsyncSession):
-    """3 retries on the entity do NOT block a customer contact action —
-    the caps are action-class-relevant."""
+    """Retry caps do not block contact actions."""
     merchant = make_merchant_id()
     await seed_policy(session)
     await seed_events(session, merchant, "sub_mixed", retries(3, now_utc()))
@@ -381,8 +365,7 @@ async def test_gate1_fraud_block_requires_human(session: AsyncSession):
 
 
 async def test_gate1_india_emandate_rule_denies(session: AsyncSession):
-    """India-issued instrument → auto-retry denied by policy row, cited
-    to the e-mandate regime."""
+    """India-issued instrument → auto-retry denied."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -425,8 +408,7 @@ async def test_gate1_deny_beats_require_human(session: AsyncSession):
 
 
 async def test_gate1_writes_decision_row(session: AsyncSession):
-    """The reason chain, policy version, and root cause are persisted —
-    'explainable' as a data structure, not a log line."""
+    """Reason chain, policy version, and root cause are persisted."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -452,9 +434,7 @@ async def test_gate1_writes_decision_row(session: AsyncSession):
 
 
 async def test_gate1_creates_state_row_and_locks(session: AsyncSession):
-    """The gate get-or-creates the entity_state row under lock — the same
-    row lock spans gate-check → intent-write (TOCTOU closed on Postgres;
-    on SQLite FOR UPDATE is a dialect no-op, correctness by single-writer)."""
+    """Get-or-creates state row under lock; TOCTOU closed on Postgres, no-op on SQLite."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -490,8 +470,7 @@ async def test_lock_entity_state_is_get_or_create(session: AsyncSession):
 
 
 async def test_gate1_unseeded_policy_is_a_hard_error(session: AsyncSession):
-    """No policy rows for the entity type → hard error. An unseeded gate
-    must never behave as an implicit allow-all."""
+    """No policy rows → hard error, never implicit allow."""
     merchant = make_merchant_id()
     with pytest.raises(LookupError):
         await evaluate(
@@ -520,8 +499,7 @@ async def _gate1(session, merchant, entity_id, action_class=ACTION_RETRY_SCHEDUL
 
 
 async def test_gate2_allows_legal_proposal_and_persists(session: AsyncSession):
-    """A legal proposal passes, and the gate2 chain lands on the SAME
-    decision row — one row carries the full evidence of both gates."""
+    """Legal proposal passes; gate-2 lands on the same decision row."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -545,8 +523,7 @@ async def test_gate2_allows_legal_proposal_and_persists(session: AsyncSession):
 
 
 async def test_gate2_denies_actions_outside_the_enum(session: AsyncSession):
-    """The model cannot invent an action — and even if decoding ever
-    leaked one, the enum backstop denies it here."""
+    """Model cannot invent actions outside the enum."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -588,7 +565,7 @@ async def test_gate2_low_confidence_requires_human(session: AsyncSession):
 
 
 async def test_gate2_dnc_denies_contact_actions(session: AsyncSession):
-    """Do-Not-Contact is what makes 'compliant' true, not asserted."""
+    """DNC denies contact actions."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -631,8 +608,7 @@ async def test_gate2_dnc_does_not_block_money_attempts(session: AsyncSession):
 
 
 async def test_gate2_rechecks_contact_cap_for_concrete_action(session: AsyncSession):
-    """Gate-1 passed at class level earlier; by gate-2 time the entity has
-    2 contacts in 24h — the concrete SEND_PAYMENT_LINK is denied."""
+    """Gate-2 rechecks the contact cap for the concrete action."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -664,8 +640,7 @@ async def test_gate2_rechecks_contact_cap_for_concrete_action(session: AsyncSess
 
 
 async def test_gate2_state_machine_legality(session: AsyncSession):
-    """From ESCALATED, a human owns the case: RETRY_NOW is illegal,
-    ESCALATE_HUMAN is the only legal move."""
+    """From ESCALATED only ESCALATE_HUMAN is legal."""
     merchant = make_merchant_id()
     await seed_policy(session)
     await seed_events(
@@ -695,8 +670,7 @@ async def test_gate2_state_machine_legality(session: AsyncSession):
 
 
 async def test_gate2_context_rule_refires(session: AsyncSession):
-    """A fraud-blocked entity doesn't get a pass just because the model
-    proposed something concrete — context rules re-fire at gate-2."""
+    """Context rules re-fire at gate-2."""
     merchant = make_merchant_id()
     await seed_policy(session)
 
@@ -724,9 +698,7 @@ async def test_gate2_context_rule_refires(session: AsyncSession):
 
 
 async def test_gate2_missing_decision_is_tolerated(session: AsyncSession):
-    """A gate-2 without its gate-1 row (e.g. record=False upstream) still
-    evaluates and returns a verdict — persistence is best-effort, the
-    verdict is not."""
+    """Missing gate-1 row still returns a verdict; persistence is best-effort."""
     merchant = make_merchant_id()
     await seed_policy(session)
 

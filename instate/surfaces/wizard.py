@@ -1,9 +1,4 @@
-"""Meniscus-grade wizard UI for `instate init`.
-
-Pixel-perfect homage to the reference image: dusty-rose banner, memory
-home path, Step 1/4 indicator, and the 9-provider picker with the same
-copy — now for Instate.
-"""
+"""Interactive setup wizard for `instate init`."""
 
 from pathlib import Path
 
@@ -15,7 +10,6 @@ from rich.text import Text
 console = Console()
 
 # ── Big banner ──
-# Dotted outline style matching the Meniscus screenshot (≈ "INSTATE")
 BANNER = r"""
  ██╗███╗   ██╗███████╗████████╗ █████╗ ████████╗███████╗
  ██║████╗  ██║██╔════╝╚══██╔══╝██╔══██╗╚══██╔══╝██╔════╝
@@ -25,9 +19,7 @@ BANNER = r"""
  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝   ╚══════╝
 """
 
-# Background taken from the screenshot (dusty rose) — rich supports
-# hex/ansi; we approximate the screenshot's #9e4b5e as "on #8b3a4a" for
-# contrast on both dark and light terminals by wrapping in a Panel.
+# White on dark rose for contrast on dark and light terminals.
 BANNER_STYLE = "bold white on #8b3a4a"
 
 PROVIDERS = [
@@ -64,11 +56,9 @@ STEPS = [
 
 
 def show_banner(memory_home: Path):
-    # Top install line like the screenshot's `uv tool install "meniscus[all]"`
     console.print("[dim]  $ uv tool install \"instate[all]\"[/dim]")
     console.print("[dim]  $ instate init[/dim]")
     console.print()
-    # Big banner — white on dusty rose, padded to feel like the screenshot
     console.print(
         Panel(
             Text(BANNER.strip("\n"), justify="center"),
@@ -86,7 +76,6 @@ def show_banner(memory_home: Path):
 def show_step(n: int):
     title, desc = STEPS[n - 1]
     console.print(f"[bold white]Step {n} of {len(STEPS)} — {title}[/bold white]")
-    # description in muted white, wrapped
     console.print(f"[#e8d5d9]{desc}[/#e8d5d9]")
     console.print()
 

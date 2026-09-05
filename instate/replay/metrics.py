@@ -1,11 +1,5 @@
-"""Instate metrics — every demo claim computed from the ledger (§11).
-
-Nothing here trusts an agent's self-report: money comes from recovered /
-reversed event payloads, compliance from a chronological violation scan,
-token economics from the decisions table, integrity from the hash chain.
-The same functions measure both agents — that's what makes the
-comparison a measurement instead of a claim.
-"""
+"""Ledger-derived run metrics: money, compliance, tokens, chain integrity.
+Same functions measure both agents; attempted rate = recovered / attempted entities."""
 
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -15,11 +9,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from instate.core.ledger import verify_chain
-from instate.core.models import Decision, Event
+from instate.core.models import Decision, EntityState, Event, TERMINAL_STATUSES
 from instate.core.projection import CONTACT_EVENT_TYPES, RETRY_EVENT_TYPES
 
-# The default policy caps (§3) — the violation scanner replays the ledger
-# against exactly the rules the gates enforce.
+# Violation scanner mirrors the gate caps.
 RETRY_LIMIT = 3
 RETRY_WINDOW = timedelta(days=7)
 CONTACT_LIMIT = 2
@@ -44,6 +37,12 @@ class RunMetrics:
     events: int = 0
     chain_breaks: int = 0
     entities_checked: int = 0
+    # Recovery-by-value companions: how fast, and how much is still open.
+    median_ttr_hours: float | None = None
+    at_risk_minor: int = 0
+    # Attempted = entities with a real attempt; excludes never-attempted.
+    attempted_entities: int = 0
+    recovered_entities: int = 0
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -60,8 +59,7 @@ class RunMetrics:
 
     @property
     def avg_input_tokens(self) -> float:
-        # Amortized cost per decision (zero-LLM counts as 0) — the
-        # headline a finance team actually cares about.
+        # Amortized per decision; zero-LLM counts as 0.
         return self.llm_input_tokens / self.decisions if self.decisions else 0.0
 
     @property
@@ -70,21 +68,21 @@ class RunMetrics:
         return self.llm_input_tokens / modeled if modeled else 0.0
 
     @property
+    def attempted_recovery_rate(self) -> float:
+        return self.recovered_entities / self.attempted_entities if self.attempted_entities else 0.0
+
+    @property
     def chain_verified(self) -> bool:
         return self.chain_breaks == 0
 
 
 # ---------------------------------------------------------------------------
-# Money — gross and net (§11: the headline must not overstate)
+# Money — gross and net
 # ---------------------------------------------------------------------------
 
 
 async def money_flow(session: AsyncSession, *, merchant_id: UUID | None = None) -> tuple[int, int]:
-    """(gross_recovered_minor, reversed_minor) from event payloads.
-
-    Refunds/chargebacks after a recovery are RecoveryReversed events —
-    netting them out is what stops the headline from overstating.
-    """
+    """(gross_recovered_minor, reversed_minor) from event payloads; RecoveryReversed is netted out."""
     q = select(Event.event_type, Event.payload).where(
         Event.event_type.in_(MONEY_RECOVERED_EVENTS | {"RecoveryReversed"})
     )
@@ -112,16 +110,7 @@ async def scan_compliance(
     *,
     merchant_id: UUID | None = None,
 ) -> tuple[int, int]:
-    """(retry_violations, contact_violations).
-
-    Replays every entity's timeline in order, maintaining the same
-    windowed counters the gates enforce, and counts attempts that landed
-    while already at/over a cap:
-      - a RetryAttempted when retry_count_7d is already >= 3
-      - a customer contact when contacts_24h is already >= 2
-    This catches exactly the behavior a stateless agent exhibits and the
-    gated agent cannot have.
-    """
+    """(retry_violations, contact_violations): attempts landing while already at cap."""
     q = select(Event).order_by(Event.merchant_id.asc(), Event.entity_id.asc(), Event.id.asc())
     if merchant_id is not None:
         q = q.where(Event.merchant_id == merchant_id)
@@ -154,6 +143,109 @@ async def scan_compliance(
 
 
 # ---------------------------------------------------------------------------
+# Time-to-recovery + at-risk revenue
+# ---------------------------------------------------------------------------
+
+
+async def time_to_recovery_hours(
+    session: AsyncSession,
+    *,
+    merchant_id: UUID | None = None,
+) -> list[float]:
+    """Hours from first failure to first recovery, recovered entities only."""
+    q = select(Event.merchant_id, Event.entity_id, Event.event_type, Event.occurred_at)
+    if merchant_id is not None:
+        q = q.where(Event.merchant_id == merchant_id)
+    q = q.order_by(Event.merchant_id.asc(), Event.entity_id.asc(), Event.occurred_at.asc())
+
+    first_failure: dict[tuple, object] = {}
+    ttrs: list[float] = []
+    for mid, eid, etype, occurred in (await session.execute(q)).all():
+        key = (mid, eid)
+        if etype == "PaymentFailed" and key not in first_failure:
+            first_failure[key] = occurred
+        elif etype in MONEY_RECOVERED_EVENTS and key in first_failure:
+            delta = (occurred - first_failure[key]).total_seconds() / 3600
+            if delta >= 0:
+                ttrs.append(delta)
+                del first_failure[key]  # first recovery only — no double counting
+    return ttrs
+
+
+async def at_risk_revenue(
+    session: AsyncSession,
+    *,
+    merchant_id: UUID | None = None,
+) -> int:
+    """Sum at-risk over open (non-terminal) entities."""
+    q = select(EntityState.amount_at_risk_minor).where(EntityState.status.notin_(TERMINAL_STATUSES))
+    if merchant_id is not None:
+        q = q.where(EntityState.merchant_id == merchant_id)
+    total = 0
+    for (amount,) in (await session.execute(q)).all():
+        total += amount or 0
+    return total
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+# ---------------------------------------------------------------------------
+# Link conversion by variant
+# ---------------------------------------------------------------------------
+
+
+async def attempted_recovery(
+    session: AsyncSession,
+    *,
+    merchant_id: UUID | None = None,
+) -> tuple[int, int]:
+    """(attempted, recovered) entities; never-attempted stay out of the denominator."""
+    q = select(Event.entity_id, Event.event_type, Event.occurred_at)
+    if merchant_id is not None:
+        q = q.where(Event.merchant_id == merchant_id)
+    q = q.order_by(Event.occurred_at.asc())
+    attempted: set = set()
+    recovered: set = set()
+    for eid, etype, _ in (await session.execute(q)).all():
+        if etype in RETRY_EVENT_TYPES:
+            attempted.add(eid)
+        elif etype in MONEY_RECOVERED_EVENTS and eid in attempted:
+            recovered.add(eid)
+    return len(attempted), len(recovered)
+
+
+async def link_conversion_by_variant(
+    session: AsyncSession,
+    *,
+    merchant_id: UUID | None = None,
+) -> dict[str, dict[str, int]]:
+    """{variant: {sent, converted}} from PaymentLinkSent payloads."""
+    q = select(Event.payload).where(Event.event_type == "PaymentLinkSent")
+    if merchant_id is not None:
+        q = q.where(Event.merchant_id == merchant_id)
+
+    out: dict[str, dict[str, int]] = {}
+    for (payload,) in (await session.execute(q)).all():
+        payload = payload or {}
+        variant = payload.get("variant")
+        if not isinstance(variant, str):
+            continue
+        bucket = out.setdefault(variant, {"sent": 0, "converted": 0})
+        bucket["sent"] += 1
+        if payload.get("converted") is True:
+            bucket["converted"] += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
 # The full measurement
 # ---------------------------------------------------------------------------
 
@@ -164,7 +256,7 @@ async def compute_run_metrics(
     merchant_id: UUID | None = None,
     max_chain_entities: int = 200,
 ) -> RunMetrics:
-    """Measure everything §11 promises, from one session's ledger."""
+    """Measure a run from its ledger."""
     m = RunMetrics()
 
     # Decisions + token economics (zero-token paths have tokens_in NULL)
@@ -179,22 +271,22 @@ async def compute_run_metrics(
             m.llm_input_tokens += tokens_in or 0
             m.llm_output_tokens += tokens_out or 0
 
-    # Money
     m.gross_recovered_minor, m.reversed_minor = await money_flow(session, merchant_id=merchant_id)
-
-    # Compliance
+    m.median_ttr_hours = _median(await time_to_recovery_hours(session, merchant_id=merchant_id))
+    m.at_risk_minor = await at_risk_revenue(session, merchant_id=merchant_id)
     m.retry_violations, m.contact_violations = await scan_compliance(
         session, merchant_id=merchant_id
     )
-
-    # Volume
+    m.attempted_entities, m.recovered_entities = await attempted_recovery(
+        session, merchant_id=merchant_id
+    )
     eq = select(func.count(func.distinct(Event.entity_id)), func.count(Event.id))
     if merchant_id is not None:
         eq = eq.where(Event.merchant_id == merchant_id)
     entities, events = (await session.execute(eq)).one()
     m.entities, m.events = entities, events
 
-    # Chain integrity — walk every entity (bounded for big runs)
+    # Chain integrity (bounded walk).
     idq = select(Event.merchant_id, Event.entity_id).group_by(Event.merchant_id, Event.entity_id)
     if merchant_id is not None:
         idq = idq.where(Event.merchant_id == merchant_id)
@@ -215,7 +307,7 @@ async def compute_run_metrics(
 
 
 def format_comparison(baseline: RunMetrics, instate: RunMetrics) -> str:
-    """The demo's money shot: one batch, two agents, one honest table."""
+    """Comparison table for baseline vs instate metrics."""
     header = f"{'metric':<34}{'baseline':>14}{'instate':>14}"
     line = "-" * len(header)
 
@@ -225,12 +317,19 @@ def format_comparison(baseline: RunMetrics, instate: RunMetrics) -> str:
     def rupees(minor: int) -> str:
         return f"₹{minor / 100:,.0f}"
 
+    def hours(value: float | None) -> str:
+        return f"{value:,.1f}h" if value is not None else "—"
+
+    # Lift = instate net minus baseline net.
+    lift_minor = instate.net_recovered_minor - baseline.net_recovered_minor
+
     rows = [
         row(
             "net money recovered",
             rupees(baseline.net_recovered_minor),
             rupees(instate.net_recovered_minor),
         ),
+        row("lift over baseline (₹)", "—", rupees(lift_minor)),
         row(
             "  gross recovered",
             rupees(baseline.gross_recovered_minor),
@@ -244,6 +343,11 @@ def format_comparison(baseline: RunMetrics, instate: RunMetrics) -> str:
         row("retry-ceiling violations", baseline.retry_violations, instate.retry_violations),
         row("contact-cap violations", baseline.contact_violations, instate.contact_violations),
         row(
+            "attempted recovery rate",
+            f"{baseline.attempted_recovery_rate:.0%} ({baseline.recovered_entities}/{baseline.attempted_entities})",
+            f"{instate.attempted_recovery_rate:.0%} ({instate.recovered_entities}/{instate.attempted_entities})",
+        ),
+        row(
             "% decisions with zero LLM calls",
             f"{baseline.zero_llm_share:.0%}",
             f"{instate.zero_llm_share:.0%}",
@@ -254,6 +358,16 @@ def format_comparison(baseline: RunMetrics, instate: RunMetrics) -> str:
             f"{instate.avg_input_tokens:,.0f}",
         ),
         row("total LLM output tokens", baseline.llm_output_tokens, instate.llm_output_tokens),
+        row(
+            "median time-to-recovery",
+            hours(baseline.median_ttr_hours),
+            hours(instate.median_ttr_hours),
+        ),
+        row(
+            "at-risk revenue (open)",
+            rupees(baseline.at_risk_minor),
+            rupees(instate.at_risk_minor),
+        ),
         row(
             "hash chain verified",
             "yes" if baseline.chain_verified else "NO",

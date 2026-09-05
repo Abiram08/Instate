@@ -1,9 +1,4 @@
-"""Chaos harness — kill at every stage (§15).
-
-Not just mid-action: mid-webhook-verify, mid-gate-lock, mid-rebuild.
-Each helper raises ChaosKill mid-function; the caller must handle it
-and the test asserts the system recovers.
-"""
+"""Chaos harness: raise ChaosKill at configured points; callers must handle it."""
 
 from contextlib import asynccontextmanager
 

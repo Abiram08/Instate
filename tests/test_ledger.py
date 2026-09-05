@@ -1,9 +1,4 @@
-"""Tests for L0 ledger — hash chain, dedupe, append-only, verify.
-
-These are the tests for Stage 1 of the build (memory core).
-They verify the per-entity hash chain, the exactly-once dedupe,
-and the tamper-evidence mechanism.
-"""
+"""L0 ledger tests: hash chain, dedupe, append-only, verify."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -81,7 +76,6 @@ async def test_record_event_multiple_entities_no_contention(session: AsyncSessio
         )
     await session.commit()
 
-    # Verify chains are independent
     result_a = await verify_chain(session, merchant, "entity_A")
     result_b = await verify_chain(session, merchant, "entity_B")
 
@@ -89,6 +83,28 @@ async def test_record_event_multiple_entities_no_contention(session: AsyncSessio
     assert result_a.event_count == 3
     assert result_b.verified
     assert result_b.event_count == 3
+
+
+async def test_timeline_as_of_pins_a_snapshot(session: AsyncSession):
+    """Point-in-time read: only events recorded at/before as_of are visible."""
+    merchant = make_merchant_id()
+    t1 = datetime(2026, 1, 1, tzinfo=UTC)
+    t2 = datetime(2026, 6, 1, tzinfo=UTC)
+    e1 = await record_event(
+        session, merchant_id=merchant, entity_id="sub_snap", entity_type="subscription",
+        event_type="PaymentFailed", occurred_at=t1,
+        payload={"failure_code": "insufficient_funds"}, source_event_id="snap_1")
+    e1.recorded_at = t1
+    e2 = await record_event(
+        session, merchant_id=merchant, entity_id="sub_snap", entity_type="subscription",
+        event_type="RetryAttempted", occurred_at=t2, source_event_id="snap_2")
+    e2.recorded_at = t2
+    await session.commit()
+
+    early = await get_timeline(session, merchant, "sub_snap", as_of=datetime(2026, 3, 1, tzinfo=UTC))
+    assert [e.id for e in early] == [e1.id]
+    full = await get_timeline(session, merchant, "sub_snap")
+    assert [e.id for e in full] == [e1.id, e2.id]
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +116,6 @@ async def test_dedupe_same_source_event_id_is_inert(session: AsyncSession):
     """A webhook redelivery with the same source_event_id is inert (no duplicate)."""
     merchant = make_merchant_id()
 
-    # First delivery
     event1 = await record_event(
         session,
         merchant_id=merchant,
@@ -113,7 +128,6 @@ async def test_dedupe_same_source_event_id_is_inert(session: AsyncSession):
     )
     await session.commit()
 
-    # Redelivery (same source_event_id)
     with pytest.raises(DuplicateEventError):
         await record_event(
             session,
@@ -127,7 +141,6 @@ async def test_dedupe_same_source_event_id_is_inert(session: AsyncSession):
         )
     await session.rollback()
 
-    # Verify only one event exists
     timeline = await get_timeline(session, merchant, "sub_123")
     assert len(timeline) == 1
     assert timeline[0].id == event1.id
@@ -173,7 +186,6 @@ async def test_no_source_event_id_allows_multiple(session: AsyncSession):
             entity_type="subscription",
             event_type="RetryAttempted",
             occurred_at=now_utc() + timedelta(minutes=i),
-            # No source_event_id — these are internal agent-generated events
         )
     await session.commit()
 
@@ -203,10 +215,8 @@ async def test_hash_chain_links_per_entity(session: AsyncSession):
         events.append(event)
     await session.commit()
 
-    # Genesis
     assert events[0].prev_hash is None
 
-    # Each subsequent event links to the previous
     for i in range(1, len(events)):
         assert events[i].prev_hash == events[i - 1].hash, (
             f"event {i}'s prev_hash should be event {i-1}'s hash"
@@ -229,7 +239,6 @@ async def test_hash_chain_is_deterministic(session: AsyncSession):
     )
     await session.commit()
 
-    # Recompute the hash manually
     payload_hash = compute_payload_hash({"key": "value"})
     expected = compute_event_hash(
         None,  # genesis
@@ -277,11 +286,7 @@ async def test_verify_chain_empty_entity(session: AsyncSession):
 
 
 async def test_redact_payload_chain_still_verifies(session: AsyncSession):
-    """After redacting payload (PII), the hash chain still verifies.
-
-    This is the load-bearing detail: payload_hash is stored separately
-    from payload, so nulling the payload doesn't break the chain.
-    """
+    """Redacted payload still verifies; payload_hash is stored separately."""
     merchant = make_merchant_id()
 
     event1 = await record_event(
@@ -304,17 +309,14 @@ async def test_redact_payload_chain_still_verifies(session: AsyncSession):
     )
     await session.commit()
 
-    # Redact the first event's payload
     redacted = await redact_payload(session, event1.id)
     await session.commit()
     assert redacted
 
-    # The chain should still verify
     result = await verify_chain(session, merchant, "sub_redact")
     assert result.verified, f"chain should verify after redaction, got: {result.error}"
     assert result.event_count == 2
 
-    # The payload is gone but the hash remains
     from sqlalchemy import select
     from instate.core.models import Event
 
@@ -332,7 +334,7 @@ async def test_redact_payload_chain_still_verifies(session: AsyncSession):
 async def test_bi_temporal_columns(session: AsyncSession):
     """occurred_at and recorded_at are stored separately."""
     merchant = make_merchant_id()
-    occurred = days_ago(3)  # the event happened 3 days ago
+    occurred = days_ago(3)
 
     event = await record_event(
         session,
@@ -344,11 +346,9 @@ async def test_bi_temporal_columns(session: AsyncSession):
     )
     await session.commit()
 
-    # occurred_at is what we passed
     assert event.occurred_at is not None
-    # recorded_at is roughly now (the transaction time)
     time_diff = (event.recorded_at - event.occurred_at).total_seconds()
-    assert time_diff > 2 * 24 * 3600  # at least 2 days difference
+    assert time_diff > 2 * 24 * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +360,6 @@ async def test_get_timeline_ordered_oldest_first(session: AsyncSession):
     """Timeline returns events in chronological order."""
     merchant = make_merchant_id()
 
-    # Insert out of chronological order
     await record_event(
         session, merchant_id=merchant, entity_id="sub_tl", entity_type="subscription",
         event_type="RetryAttempted", occurred_at=now_utc() + timedelta(hours=2),
@@ -383,7 +382,7 @@ async def test_get_timeline_ordered_oldest_first(session: AsyncSession):
 
 
 async def test_get_timeline_limit_poka_yoke(session: AsyncSession):
-    """Timeline limit prevents a naive caller from dumping the entire log."""
+    """Timeline limit bounds the read."""
     merchant = make_merchant_id()
 
     for i in range(20):

@@ -1,4 +1,4 @@
-"""LLM failover — primary down → secondary, then default (§15)."""
+"""LLM failover: primary → secondary → policy default."""
 
 from typing import Protocol
 
@@ -8,8 +8,7 @@ class Reasoner(Protocol):
 
 
 class FailoverReasoner:
-    """Try primary; on None/exception, try secondary; on still None,
-    return None (caller falls back to deterministic policy default)."""
+    """Try primary then secondary; None means caller uses policy default."""
 
     def __init__(self, primary: Reasoner, secondary: Reasoner | None = None):
         self.primary = primary

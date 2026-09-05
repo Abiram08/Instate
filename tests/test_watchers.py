@@ -1,9 +1,4 @@
-"""Tests for watchers — memory that initiates (§2).
-
-Conditions over L1/L2 facts only (integers and timestamps, never
-embeddings), signed delivery, and cooldown so nudging never becomes
-spamming.
-"""
+"""Watchers over L1/L2 facts with signed delivery and cooldown."""
 
 from datetime import timedelta
 
@@ -22,7 +17,7 @@ from tests.conftest import days_ago, make_merchant_id, now_utc
 
 
 class RecordingNotifier:
-    """Captures pushes; fails when told to (delivery failure = degradation)."""
+    """Test notifier capturing pushes."""
 
     def __init__(self, fail: bool = False):
         self.fail = fail
@@ -53,8 +48,7 @@ async def _watcher(
 
 
 async def test_retry_warning_fires_before_the_ceiling(session: AsyncSession):
-    """retry_count_7d >= 2 on a 3-cap entity: warn BEFORE the next attempt
-    would hit the ceiling — the same indexed count the gates use."""
+    """Pins warn at 2/3 before ceiling."""
     merchant = make_merchant_id()
     for i in range(2):
         await record_event(
@@ -78,7 +72,7 @@ async def test_retry_warning_fires_before_the_ceiling(session: AsyncSession):
     url, payload, signature = notifier.pushes[0]
     assert payload["entity_id"] == "w_retry"
     assert payload["observed"]["retry_count_7d"] == 2
-    assert signature is not None  # signed delivery
+    assert signature is not None
 
 
 async def test_watcher_ignores_entities_below_threshold(session: AsyncSession):
@@ -102,7 +96,6 @@ async def test_watcher_ignores_entities_below_threshold(session: AsyncSession):
 
 
 async def test_open_ptp_due_watcher(session: AsyncSession):
-    """A promise that came due pushes a webhook."""
     merchant = make_merchant_id()
     await record_event(
         session,
@@ -133,7 +126,6 @@ async def test_open_ptp_due_watcher(session: AsyncSession):
 
 
 async def test_cooldown_prevents_spam(session: AsyncSession):
-    """A tripped watcher fires once per cooldown window — nudge, not spam."""
     merchant = make_merchant_id()
     for i in range(2):
         await record_event(
@@ -157,20 +149,18 @@ async def test_cooldown_prevents_spam(session: AsyncSession):
     second = await check_watchers(
         session,
         notifier=notifier,
-        now=now_utc() + timedelta(minutes=30),  # within cooldown
+        now=now_utc() + timedelta(minutes=30),
     )
     third = await check_watchers(
         session,
         notifier=notifier,
-        now=now_utc() + timedelta(hours=2),  # cooldown over
+        now=now_utc() + timedelta(hours=2),
     )
 
     assert (first, second, third) == (1, 0, 1)
 
 
 async def test_failed_delivery_does_not_consume_cooldown(session: AsyncSession):
-    """A degraded receiver must not silence the watcher — the trip
-    remains pending until delivery succeeds."""
     merchant = make_merchant_id()
     for i in range(2):
         await record_event(
@@ -192,7 +182,7 @@ async def test_failed_delivery_does_not_consume_cooldown(session: AsyncSession):
 
     healthy = RecordingNotifier()
     fired = await check_watchers(session, notifier=healthy, now=now_utc() + timedelta(seconds=1))
-    assert fired == 1  # delivered on the next tick
+    assert fired == 1
 
 
 async def test_sign_payload_is_hmac_and_deterministic():
@@ -213,11 +203,10 @@ async def test_seed_default_watchers_is_idempotent(session: AsyncSession):
     second = await seed_default_watchers(
         session, merchant_id=merchant, target_url="https://agent.example/hook"
     )
-    assert first == 3
+    assert first == 4  # retry, PTP overdue, stale, pre-expiry
     assert second == 0
 
 
 def test_httpx_notifier_exists_as_protocol_implementation():
-    """The production notifier is a drop-in for the Notifier protocol."""
     notifier = HTTPXNotifier(timeout_seconds=1.0)
     assert hasattr(notifier, "send")

@@ -1,18 +1,4 @@
-"""Instate ops — traffic control, circuit breaking, spend guards (§10).
-
-Graceful degradation covers *dependencies*; this module covers *traffic*.
-Every mechanism here is small, testable, and framework-free — the webhook
-receiver and the MCP surface compose them; the core never sees them.
-
-- TokenBucket: the rate limiter. Per-merchant, per-surface.
-- RateLimits: the per-merchant registry (reads ~100/min, writes ~30/min).
-- CircuitBreaker: consecutive failures → open (fail fast to the
-  deterministic policy default) → half-open probe. Prevents retry storms
-  against a degraded dependency.
-- SpendGuard: the LLM budget — global concurrency semaphore + per-merchant
-  cost cap. Over budget → refuse-with-default-action (the fallback path
-  already exists, §7).
-"""
+"""Traffic control: rate limiting, circuit breaking, spend guards (§10)."""
 
 import asyncio
 import time
@@ -31,8 +17,7 @@ class BucketState:
 
 
 class TokenBucket:
-    """Classic token bucket — capacity + refill per second, thread-safe
-    enough for asyncio (single-threaded event loop, no awaits inside)."""
+    """Token bucket: capacity + refill per second. Safe for asyncio (no awaits inside)."""
 
     def __init__(self, capacity: float, refill_per_second: float):
         self.capacity = capacity
@@ -48,8 +33,7 @@ class TokenBucket:
         self._state.last_refill = now
 
     def try_take(self, amount: float = 1.0) -> bool:
-        """Take a token if available; never blocks — the caller answers
-        429 + Retry-After instead."""
+        """Take a token if available; never blocks (caller answers 429 + Retry-After)."""
         self._refill()
         if self._state.tokens >= amount:
             self._state.tokens -= amount
@@ -57,7 +41,7 @@ class TokenBucket:
         return False
 
     def retry_after_seconds(self, amount: float = 1.0) -> float:
-        """How long until a retry could succeed (for the Retry-After header)."""
+        """Seconds until a retry could succeed (for Retry-After)."""
         self._refill()
         deficit = amount - self._state.tokens
         if deficit <= 0:
@@ -65,9 +49,7 @@ class TokenBucket:
         return deficit / self.refill_per_second
 
 
-# ---------------------------------------------------------------------------
-# Per-merchant rate limits (§10: reads ~100/min, writes ~30/min)
-# ---------------------------------------------------------------------------
+# Per-merchant rate limits (§10)
 
 
 @dataclass
@@ -95,18 +77,11 @@ class RateLimits:
     _writes: dict = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
 # Circuit breaker
-# ---------------------------------------------------------------------------
 
 
 class CircuitBreaker:
-    """CLOSED → (N consecutive failures) → OPEN → (cooldown) → HALF_OPEN.
-
-    OPEN means fail fast: the caller uses the deterministic policy default
-    instead of hammering a degraded dependency. HALF_OPEN lets one probe
-    through; success closes, failure re-opens.
-    """
+    """CLOSED → OPEN → HALF_OPEN. OPEN fails fast to the deterministic policy default."""
 
     def __init__(self, failure_threshold: int = 5, cooldown_seconds: float = 30.0):
         self.failure_threshold = failure_threshold
@@ -142,7 +117,6 @@ class CircuitBreaker:
 
     def record_failure(self) -> None:
         if self.state == "half_open":
-            # the probe failed — trip again, restart the cooldown
             self._opened_at = time.monotonic()
             self._half_open_probe_in_flight = False
             return
@@ -151,19 +125,11 @@ class CircuitBreaker:
             self._opened_at = time.monotonic()
 
 
-# ---------------------------------------------------------------------------
 # LLM spend guard
-# ---------------------------------------------------------------------------
 
 
 class SpendGuard:
-    """The LLM budget (§10): a global concurrency semaphore + per-merchant
-    cost caps. Over budget → refuse-with-default-action (the deterministic
-    fallback path already exists — the guard just invokes it earlier).
-
-    Cost is recorded in micros (1e-6 currency units), matching
-    `decisions.cost_micros`.
-    """
+    """LLM budget: global concurrency + per-merchant cost caps (§10). Cost in micros."""
 
     def __init__(self, max_in_flight: int = 5, per_merchant_budget_micros: int | None = None):
         self._semaphore = asyncio.Semaphore(max_in_flight)
@@ -175,7 +141,7 @@ class SpendGuard:
         return self._semaphore._value  # noqa: SLF001 — read-only peek for metrics
 
     async def acquire(self, merchant_id: str, estimated_cost_micros: int = 0) -> bool:
-        """May this LLM call proceed at all? (concurrency + budget)"""
+        """Check concurrency + budget before an LLM call."""
         if self._budget is not None:
             if self._spent.get(merchant_id, 0) + estimated_cost_micros > self._budget:
                 return False

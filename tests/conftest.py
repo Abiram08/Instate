@@ -1,4 +1,4 @@
-"""Test fixtures — in-memory SQLite per test (fast, isolated)."""
+"""In-memory SQLite per test."""
 
 import asyncio
 from datetime import UTC, datetime, timedelta
@@ -13,7 +13,6 @@ from instate.core.database import get_session_factory
 
 @pytest.fixture(scope="session")
 def event_loop():
-    """Event loop for the test session (pytest-asyncio)."""
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
@@ -21,10 +20,7 @@ def event_loop():
 
 @pytest_asyncio.fixture
 async def session():
-    """Provide a fresh in-memory database session per test.
-
-    Each test gets its own database, so tests are fully isolated.
-    """
+    """Fresh in-memory DB session per test."""
     import os
 
     os.environ["INSTATE_DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
@@ -40,9 +36,7 @@ async def session():
     await close_db()
 
 
-# ---------------------------------------------------------------------------
-# Helpers for building test events
-# ---------------------------------------------------------------------------
+# Helpers
 
 
 def make_merchant_id():

@@ -1,9 +1,4 @@
-"""Secrets vault — env today, Vault/Secrets Manager tomorrow (§15).
-
-The interface is the same either way: `vault.get("RAZORPAY_KEY")`.
-In production, swap `EnvVault` for `ExternalVault` backed by
-HashiCorp Vault / AWS Secrets Manager — rotation is a single call.
-"""
+"""Secrets vault interface (§15)."""
 
 import os
 from typing import Protocol
@@ -16,17 +11,7 @@ class Vault(Protocol):
 
 
 class EnvVault:
-    """Dev/demo vault: in-memory overrides, secret FILES, then env vars.
-
-    Lookup order per key:
-      1. in-memory override (set/rotate this process)
-      2. `<KEY>_FILE` — path to a file holding the secret (Docker-secrets
-         style). Secrets on disk are invisible to `ps aux`, unlike env.
-      3. plain env var (convenient, least safe — fine for test keys)
-
-    Rotation updates the override map and the process env so the next
-    `get` sees it immediately.
-    """
+    """Env-backed vault: in-memory overrides, then <KEY>_FILE, then env."""
 
     def __init__(self):
         self._overrides: dict[str, str] = {}
@@ -53,13 +38,8 @@ class EnvVault:
         self.set(key, new_value)
 
 
-# Production hook — implement against your secret store:
 class ExternalVault:
-    """Stub for HashiCorp Vault / AWS Secrets Manager.
-
-    Replace `get`/`rotate` with real SDK calls. The rest of the codebase
-    never knows or cares.
-    """
+    """Stub for an external secret store."""
 
     def __init__(self, client):
         self._client = client

@@ -1,10 +1,4 @@
-"""Tests for the MCP surface — stateless streamable HTTP, JSON-RPC 2.0.
-
-The generality proof: an MCP client connects and answers questions about
-an entity with zero human configuration (instate://about). Reads are
-split from writes; every tool declares an output schema; a read never
-writes a decision.
-"""
+"""MCP surface tests: stateless streamable HTTP, JSON-RPC 2.0; reads split from writes."""
 
 import json
 from uuid import uuid4
@@ -103,8 +97,7 @@ def test_initialize_handshake(mcp):
 
 
 def test_about_manifest_is_self_describing(mcp):
-    """The Context.dev pattern: an agent onboards itself with zero human
-    config — capabilities, auth, guarantees, examples."""
+    """About manifest is self-describing (capabilities, auth, guarantees)."""
     client, _ = mcp
     resp = _call(client, _rpc("resources/read", {"uri": "instate://about"}))
     manifest = json.loads(resp.json()["result"]["contents"][0]["text"])
@@ -158,8 +151,7 @@ def test_tool_timeline_returns_the_trail(mcp):
 
 
 def test_tool_check_policy_denies_at_ceiling(mcp):
-    """sub_mcp has 3 retries — the gate says DENY with the reason chain,
-    and the read wrote NO decision row (a read stays a read)."""
+    """At ceiling → DENY; read writes no decision row."""
     client, merchant = mcp
     resp = _call(
         client,
@@ -205,8 +197,7 @@ def test_tool_find_precedent_returns_empty_gracefully(mcp):
 
 
 def test_write_tool_gated_when_disabled(tmp_path):
-    """Reads split from writes: allow_writes=False → the write tool
-    refuses, read tools work."""
+    """allow_writes=False blocks writes, allows reads."""
     from sqlalchemy.pool import NullPool
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'mcp2.db'}", poolclass=NullPool)
@@ -267,10 +258,7 @@ def test_write_tool_records_when_enabled(mcp):
 
 
 def test_write_tool_is_idempotent(mcp):
-    """Same idempotency key twice → the ledger's UNIQUE constraint holds:
-    the second call reports `recorded: false, duplicate: true` — a
-    double-calling agent can't double-write, and a redelivery is a
-    success story, not an error."""
+    """Same idempotency key twice → duplicate, not double-write."""
     client, merchant = mcp
     args = {
         "merchant_id": str(merchant),
@@ -290,9 +278,7 @@ def test_write_tool_is_idempotent(mcp):
 
 
 def test_write_tool_strips_hostile_payload(mcp):
-    """An MCP caller cannot inject gate-steering keys: `root_cause` is
-    derived by diagnose, never asserted — the write tool strips it and
-    reports what it stripped."""
+    """Gate-steering keys are stripped on write."""
 
 
     client, merchant = mcp

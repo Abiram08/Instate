@@ -1,21 +1,7 @@
-"""Instate L3 precedent — what worked before, as embedded case summaries.
+"""L3 precedent: embedded resolved-case summaries, advisory only (§4).
 
-The ONLY tier that touches an embedding (§4 of architecture.md), and the
-only tier whose answers are probabilistic — which is exactly why it may
-NEVER gate an action. L3 going down is a degradation, not an outage:
-`find_precedent` returning [] must leave the agent fully functional.
-
-Design rules (§4):
-1. Embed case SUMMARIES ({situation → action → outcome}), never raw
-   events — far fewer vectors, far better retrieval.
-2. Resolved cases only — an unresolved case has nothing to teach.
-3. Pre-filter before ranking — never a flat search over everything:
-   entity_type + root_cause + merchant scope first, similarity second.
-
-Embeddings here are a deterministic hashing embedder (no API, works
-offline, stable for tests/demo). `GeminiEmbedder` is the production
-drop-in (same protocol). On production Postgres the ranking moves to a
-pgvector `<=>` index (§15 backlog) — the protocol stays identical.
+Never gates an action; [] is a normal answer. Pre-filter by type, cause,
+and scope before similarity rank.
 """
 
 import hashlib
@@ -53,13 +39,7 @@ _TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
 
 class HashingEmbedder:
-    """Deterministic bag-of-tokens hashing — no API key, byte-stable.
-
-    Every token hashes to a bucket; counts are L2-normalized. Cosine
-    similarity then behaves like weighted keyword overlap — good enough
-    for demo-scale precedent recall on structured case summaries, and
-    exactly reproducible in tests.
-    """
+    """Deterministic bag-of-tokens embedder; cosine ≈ keyword overlap."""
 
     def __init__(self, dims: int = EMBEDDING_DIMS):
         self.dims = dims
@@ -74,11 +54,7 @@ class HashingEmbedder:
 
 
 class GeminiEmbedder:
-    """Production embedder (google-genai, gemini-embedding-001, 1024d).
-
-    Same protocol as HashingEmbedder — `find_precedent` never knows or
-    cares which one is in use. Imported lazily.
-    """
+    """Production embedder with the same protocol; imported lazily."""
 
     def __init__(self, model: str = "gemini-embedding-001", api_key: str | None = None):
         from google import genai  # lazy
@@ -98,7 +74,7 @@ class GeminiEmbedder:
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Plain cosine — the only math L3 is allowed to do."""
+    """Cosine similarity."""
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
@@ -134,14 +110,9 @@ async def build_case_from_entity(
     entity: EntityState,
     embedder: Embedder | None = None,
 ) -> Case | None:
-    """Summarize a RESOLVED entity into a case. Unresolved → None.
-
-    The summary is assembled from the ledger's own facts: the last
-    failure's root cause, the actions taken, and the outcome amount —
-    nothing is invented.
-    """
+    """Summarize a resolved entity into a case; unresolved → None."""
     if entity.status != STATUS_RECOVERED:
-        return None  # an unresolved case has nothing to teach
+        return None
 
     events = await session.execute(
         select(Event)
@@ -250,15 +221,8 @@ async def find_precedent(
     embedder: Embedder | None = None,
     top_k: int = 3,
 ) -> list[dict]:
-    """Top-k resolved cases for this shape of problem — advisory only.
-
-    Returns [] on ANY failure path (empty store, embedder down, no
-    matches): L3 is advisory-only, so empty is a normal answer, never an
-    outage (§10). The caller feeds the one-liners to the model; nothing
-    here can gate an action.
-    """
-    # Pre-filter: entity_type + root_cause + merchant scope — never a
-    # flat search over the whole store (§4 rule 3)
+    """Top-k resolved cases, advisory only; [] on any failure path."""
+    # Pre-filter by type + cause + scope; never a flat search (§4).
     result = await session.execute(
         select(Case).where(
             Case.entity_type == entity_type,

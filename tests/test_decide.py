@@ -1,16 +1,5 @@
-"""Tests for the agent pipeline — the thin workflow, end to end.
-
-Every path is testable WITHOUT a model (that's the point of a workflow,
-not an autonomous loop): the tests inject a FakeReasoner and a
-FakeGateway. What they prove:
-
-- the majority-of-events-never-reach-the-model claim: gate-1 deny,
-  fixed-action routes, and UNKNOWN all resolve at zero tokens
-- the one LLM call's output is validated and gated before execution
-- LLM failure → the deterministic policy default (no drama)
-- the outbox: intent before gateway, outcome after, everything linked
-- the drain: webhooks appended but never processed get processed once
-"""
+"""Agent pipeline tests with FakeReasoner/FakeGateway.
+Covers zero-LLM routes, gated LLM path, outbox linkage, and drain idempotence."""
 
 from datetime import timedelta
 
@@ -132,15 +121,12 @@ async def query_events(session, merchant, entity_id) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Deterministic routes — zero tokens
+# Deterministic routes
 # ---------------------------------------------------------------------------
 
 
 async def test_fraud_block_is_deterministic_zero_llm(session: AsyncSession):
-    """fraud_block → fixed ESCALATE_HUMAN route, zero tokens. In practice
-    BOTH zero-token mechanisms fire: the fraud context rule at Gate-1
-    (REQUIRE_HUMAN, with the policy citation in the reason chain) and the
-    deterministic taxonomy route. Either way: no model, human owns it."""
+    """fraud_block → ESCALATE_HUMAN with zero LLM."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     reasoner = FakeReasoner(GOOD_PROPOSAL)
@@ -181,8 +167,7 @@ async def test_mandate_inactive_is_deterministic_zero_llm(session: AsyncSession)
 
 
 async def test_unknown_code_escalates_safely(session: AsyncSession):
-    """An unmapped failure code still has a branch: UNKNOWN → deterministic
-    escalate. The pipeline cannot dead-end on novelty."""
+    """Unmapped code → UNKNOWN → deterministic escalate."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     reasoner = FakeReasoner(GOOD_PROPOSAL)
@@ -198,8 +183,7 @@ async def test_unknown_code_escalates_safely(session: AsyncSession):
 
 
 async def test_gate1_deny_stops_before_the_model(session: AsyncSession):
-    """An entity at its retry ceiling → Gate-1 DENY → escalate, and the
-    reasoner is never invoked (the zero-token headline path)."""
+    """At ceiling → Gate-1 DENY without invoking the model."""
     merchant = make_merchant_id()
     await seed_stage3(session)
 
@@ -232,13 +216,12 @@ async def test_gate1_deny_stops_before_the_model(session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
-# The one LLM call — validated, gated, then executed
+# LLM path
 # ---------------------------------------------------------------------------
 
 
 async def test_happy_path_llm_proposal_executes(session: AsyncSession):
-    """network_timeout + legal proposal → gate-2 allows → gateway called
-    → outcome events written, linked to the decision."""
+    """Legal proposal → gate-2 ALLOW → gateway called, outcome linked."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     reasoner = FakeReasoner(GOOD_PROPOSAL)
@@ -270,9 +253,7 @@ async def test_happy_path_llm_proposal_executes(session: AsyncSession):
 
 
 async def test_invalid_llm_output_falls_back_to_policy_default(session: AsyncSession):
-    """The model proposes an illegal action → validate_proposal returns
-    None → the deterministic policy default takes over — no retries,
-    no drama (§7 failure path)."""
+    """Illegal model output → deterministic policy default."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     reasoner = FakeReasoner({"action": "CHARGE_THEM_TWICE", "confidence": 0.99})
@@ -283,15 +264,13 @@ async def test_invalid_llm_output_falls_back_to_policy_default(session: AsyncSes
     await session.commit()
 
     assert result.path == "policy_default"
-    assert result.llm_called is False  # an invalid output is no output
-    # network_timeout's policy default is RETRY_NOW — executed directly
+    assert result.llm_called is False
     assert result.executed_action == "RETRY_NOW"
     assert len(gateway.calls) == 1
 
 
 async def test_llm_failure_falls_back_to_policy_default(session: AsyncSession):
-    """The SDK throws / refuses → None → policy default. network_timeout
-    → RETRY_NOW via the default, still gated, still audited."""
+    """Model failure (None) → policy default, still gated."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     reasoner = FakeReasoner(None, fail=True)
@@ -310,8 +289,7 @@ async def test_llm_failure_falls_back_to_policy_default(session: AsyncSession):
 
 
 async def test_insufficient_funds_defaults_to_scheduling(session: AsyncSession):
-    """insufficient_funds → RETRY_SCHEDULED: a scheduled retry never hits
-    the gateway at decision time; it lands in scheduled_actions."""
+    """insufficient_funds → RETRY_SCHEDULED without touching the gateway."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     reasoner = FakeReasoner(
@@ -329,7 +307,7 @@ async def test_insufficient_funds_defaults_to_scheduling(session: AsyncSession):
     await session.commit()
 
     assert result.executed_action == "RETRY_SCHEDULED"
-    assert gateway.calls == []  # nothing touches money now
+    assert gateway.calls == []
 
     types = await query_events(session, merchant, "pay_payday")
     assert "RetryScheduled" in types
@@ -359,8 +337,6 @@ async def test_gate2_dnc_stops_a_contact_action(session: AsyncSession):
     )
     await session.commit()
 
-    # card_expired's default is REQUEST_PAYMENT_METHOD (non-deterministic),
-    # so the model runs — and gate-2 denies the contact under DNC.
     assert result.path == "gate2_stop"
     assert result.llm_called is True
     assert gateway.calls == []
@@ -386,13 +362,12 @@ async def test_low_confidence_routes_to_human(session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
-# The drain — ledger-first webhooks, processed exactly once
+# Drain
 # ---------------------------------------------------------------------------
 
 
 async def test_drain_processes_pending_and_only_once(session: AsyncSession):
-    """Two fresh failures + one already-diagnosed failure → the drain
-    processes exactly the two pending ones. Idempotent by construction."""
+    """Drain processes pending failures exactly once."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     reasoner = FakeReasoner(GOOD_PROPOSAL)
@@ -420,7 +395,6 @@ async def test_drain_processes_pending_and_only_once(session: AsyncSession):
     assert len(results) == 2
     assert {r.entity_id for r in results} == {"pay_a", "pay_b"}
 
-    # A second drain is a no-op — everything is diagnosed now
     again = await drain_pending(session, reasoner=reasoner, gateway=gateway)
     await session.commit()
     assert again == []
@@ -433,13 +407,12 @@ async def test_drain_empty_ledger_is_noop(session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
-# Scheduled retries — the durable queue fires when due
+# Scheduled retries
 # ---------------------------------------------------------------------------
 
 
 async def test_scheduled_retry_fires_only_when_due(session: AsyncSession):
-    """A T_PLUS_48H scheduled retry: not executed before due, executed as
-    RETRY_NOW after, through the same outbox."""
+    """T+48H retry fires only when due, once."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     gateway = FakeGateway()
@@ -478,14 +451,12 @@ async def test_scheduled_retry_fires_only_when_due(session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
-# Failure execution — a decline is a fact, written to the ledger
+# Failure execution
 # ---------------------------------------------------------------------------
 
 
 async def test_gateway_failure_writes_action_failed(session: AsyncSession):
-    """A gateway 'failed' response is a real outcome: ActionFailed + the
-    outcome event land in the ledger (the stateless baseline would have
-    just retried again)."""
+    """Gateway failure writes ActionFailed + outcome to the ledger."""
     merchant = make_merchant_id()
     await seed_stage3(session)
     gateway = FakeGateway(status="failed")

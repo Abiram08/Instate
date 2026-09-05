@@ -1,0 +1,1 @@
+{"event": "payment.failed", "id": "evt_card_001", "payload": {"payment": {"id": "pay_dead", "error_reason": "CARD_EXPIRED"}}}

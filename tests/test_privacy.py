@@ -1,9 +1,4 @@
-"""Network-scope privacy — the moat only exists if trust does (§15).
-
-k=3 is a DEMO threshold (three merchants is a group chat, not
-anonymity); production uses PRODUCTION_K=10 + Laplace noise. These
-tests pin both the mechanism and the honesty about the default.
-"""
+"""Network-scope privacy via k-anonymity threshold."""
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,8 +38,6 @@ async def test_pattern_publishable_at_demo_k(session: AsyncSession):
 
 
 async def test_production_k_holds_back_small_groups(session: AsyncSession):
-    """Three merchants clear the demo bar but NOT the production bar —
-    the threshold is a deployment knob, and the demo says so."""
     assert PRODUCTION_K == 10
     merchants = [make_merchant_id() for _ in range(3)]
     for m in merchants:
@@ -71,5 +64,4 @@ async def test_single_merchant_pattern_never_publishable(session: AsyncSession):
     await _private_case(session, merchant, 1)
     await session.commit()
 
-    # Two cases, one merchant — distinct-merchant counting holds
     assert await publishable_patterns(session) == []

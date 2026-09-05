@@ -1,8 +1,4 @@
-"""Tests for the webhook surface — ledger-first, signature-verified (§6 step 0).
-
-The receiver does exactly four things: verify → validate → dedupe+append →
-200. These tests prove each gate in that order, plus the FastAPI wrapper.
-"""
+"""Webhook surface tests: verify → validate → dedupe+append → 200."""
 
 import hashlib
 import hmac
@@ -87,33 +83,75 @@ def test_missing_signature_fails():
 
 def test_extract_failure_payment():
     raw = json.loads(razorpay_body())
-    event, entity_id, entity_type, code, amount = extract_failure(raw)
+    event, entity_id, entity_type, code, amount, extras = extract_failure(raw)
     assert event == "payment.failed"
     assert entity_id == "pay_ABC123"
     assert entity_type == "payment"
     assert code == "insufficient_funds"
     assert amount is None  # absent amount stays absent (honest, not zero)
+    assert extras == {"status": "failed"}
 
 
 def test_extract_failure_captures_amount():
-    """Razorpay amounts are minor units already — captured for metrics,
-    never trusted blindly (non-int/negative → absent)."""
+    """Amounts are minor units; non-int/negative → absent."""
     raw = json.loads(razorpay_body(amount=49900))
-    *_, amount = extract_failure(raw)
+    *_, amount, _ = extract_failure(raw)
     assert amount == 49900
 
     raw_bad = json.loads(razorpay_body(amount="49900"))
-    *_, bad_amount = extract_failure(raw_bad)
+    *_, bad_amount, _ = extract_failure(raw_bad)
     assert bad_amount is None
 
     raw_neg = json.loads(razorpay_body(amount=-5))
-    *_, neg_amount = extract_failure(raw_neg)
+    *_, neg_amount, _ = extract_failure(raw_neg)
     assert neg_amount is None
+
+
+def test_extract_failure_real_razorpay_shape():
+    """Real dashboard shape: payload.payment.entity nesting + error_code."""
+    raw = {
+        "entity": "event",
+        "account_id": "acc_test123",
+        "event": "payment.failed",
+        "contains": ["payment"],
+        "payload": {"payment": {"entity": {
+            "id": "pay_REAL01", "entity": "payment", "amount": 50000,
+            "currency": "INR", "status": "failed", "method": "netbanking",
+            "order_id": "order_test01", "error_code": "BAD_REQUEST_ERROR",
+            "error_description": "Payment failed", "error_source": "bank",
+            "error_step": "payment_authorization", "error_reason": "payment_failed",
+        }}},
+        "created_at": 1758610215,
+    }
+    event, entity_id, entity_type, code, amount, extras = extract_failure(raw)
+    assert entity_id == "pay_REAL01"
+    assert code == "payment_failed"
+    assert amount == 50000
+    assert extras == {"method": "netbanking", "order_id": "order_test01",
+                      "status": "failed", "error_code": "BAD_REQUEST_ERROR",
+                      "error_source": "bank"}
+
+
+async def test_real_shaped_delivery_is_captured_with_context(session: AsyncSession):
+    """End to end: real shape → captured, context scalars on the ledger."""
+    merchant = make_merchant_id()
+    inner = {"id": "pay_REAL02", "entity": "payment", "amount": 50000,
+             "status": "failed", "method": "upi", "order_id": "order_test02",
+             "error_code": "BAD_REQUEST_ERROR", "error_reason": "payment_failed"}
+    body = json.dumps({"event": "payment.failed", "id": "evt_real_02",
+                       "payload": {"payment": {"entity": inner}}}).encode()
+    status, message = await handle_webhook(
+        session, raw_body=body, signature=sign(body), secret=SECRET, merchant_id=merchant)
+    assert status == 200 and message.startswith("captured #")
+    event = await session.get(Event, int(message.split("#")[1].split()[0]))
+    assert event.payload["failure_code"] == "payment_failed"
+    assert event.payload["method"] == "upi"
+    assert event.payload["order_id"] == "order_test02"
 
 
 def test_extract_failure_subscription():
     raw = json.loads(razorpay_body(event="subscription.charged.failed", entity_id="sub_XYZ"))
-    _, entity_id, entity_type, _, _ = extract_failure(raw)
+    _, entity_id, entity_type, _, _, _ = extract_failure(raw)
     assert entity_id == "sub_XYZ"
     assert entity_type == "subscription"
 
@@ -134,15 +172,14 @@ def test_extract_failure_unknown_event_rejected():
 
 
 def test_extract_failure_missing_entity_rejected():
-    """An event without an entity has nothing to act on — rejected, not
-    guessed (junk never reaches the ledger)."""
+    """Event without entity is rejected, never guessed."""
     raw = {"event": "payment.failed", "payload": {"payment": {}}}
     with pytest.raises(WebhookRejected):
         extract_failure(raw)
 
 
 # ---------------------------------------------------------------------------
-# handle_webhook — the four things, ledger-first
+# handle_webhook
 # ---------------------------------------------------------------------------
 
 
@@ -168,8 +205,34 @@ async def test_valid_webhook_is_captured(session: AsyncSession):
     assert events[0].source_event_id == "evt_N0DElQ1ZsDFPaY"
 
 
+async def test_capture_returns_bookmark_with_chain_head(session: AsyncSession):
+    """The 200 carries a read-your-write token: event id + chain head."""
+    merchant = make_merchant_id()
+    body = razorpay_body()
+    status, message = await handle_webhook(
+        session, raw_body=body, signature=sign(body), secret=SECRET, merchant_id=merchant)
+    assert status == 200
+    assert message.startswith("captured #") and "head=" in message
+    head = message.split("head=")[1]
+
+    event = await session.get(Event, int(message.split("#")[1].split()[0]))
+    assert event is not None and event.hash.hex()[:12] == head
+
+
+async def test_redelivery_bookmark_names_the_same_head(session: AsyncSession):
+    """A redelivery is inert but names the identical ledger position."""
+    merchant = make_merchant_id()
+    body = razorpay_body()
+    _, first = await handle_webhook(
+        session, raw_body=body, signature=sign(body), secret=SECRET, merchant_id=merchant)
+    status, second = await handle_webhook(
+        session, raw_body=body, signature=sign(body), secret=SECRET, merchant_id=merchant)
+    assert status == 200 and "duplicate" in second
+    assert second.split("head=")[1] == first.split("head=")[1]
+
+
 async def test_bad_signature_never_touches_the_ledger(session: AsyncSession):
-    """THE security invariant: an unverified event never reaches L0."""
+    """Unverified event never reaches L0."""
     merchant = make_merchant_id()
     body = razorpay_body()
 
@@ -188,8 +251,7 @@ async def test_bad_signature_never_touches_the_ledger(session: AsyncSession):
 
 
 async def test_redelivery_is_inert_and_still_200(session: AsyncSession):
-    """Razorpay retries delivery as a matter of course: same delivery id →
-    dedupe → one event, two 200s. The dedupe is a success story."""
+    """Same delivery id → dedupe → one event, two 200s."""
     merchant = make_merchant_id()
     body = razorpay_body()
 
@@ -231,7 +293,7 @@ async def test_malformed_json_rejected(session: AsyncSession):
 
 
 async def test_oversized_body_rejected(session: AsyncSession):
-    """Bounded payloads — junk never reaches the ledger (§10)."""
+    """Oversized body is rejected (413)."""
     merchant = make_merchant_id()
     from instate.surfaces.webhook import MAX_BODY_BYTES
 
@@ -263,9 +325,7 @@ async def test_non_object_body_rejected(session: AsyncSession):
 
 
 async def test_hostile_entity_fields_never_reach_the_ledger(session: AsyncSession):
-    """Merchant-controlled junk (injected root_cause, PII, blobs) is
-    stripped at ingestion: the stored payload holds extracted scalars
-    only — so hostile keys can never steer diagnose or precedent."""
+    """Hostile payload keys are stripped; only extracted scalars stored."""
     merchant = make_merchant_id()
     body = razorpay_body(
         amount=49900,
@@ -295,18 +355,12 @@ async def test_hostile_entity_fields_never_reach_the_ledger(session: AsyncSessio
 
 
 # ---------------------------------------------------------------------------
-# The FastAPI wrapper
+# FastAPI wrapper
 # ---------------------------------------------------------------------------
 
 
 async def test_create_app_end_to_end(tmp_path):
-    """The HTTP surface: signed POST → 200 → event captured; redelivery →
-    200; unsigned → 401 with the ledger untouched.
-
-    The app runs on the TestClient's portal loop, so the factory uses a
-    temp-file DB with NullPool — every checkout is a fresh connection in
-    the loop that asks for it, and state lives in the shared file.
-    """
+    """HTTP surface: signed → 200, redelivery → 200, unsigned → 401."""
     fastapi_test = pytest.importorskip("fastapi.testclient")
 
     from sqlalchemy.ext.asyncio import (

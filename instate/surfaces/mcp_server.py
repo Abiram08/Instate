@@ -1,34 +1,6 @@
-"""Instate MCP surface — memory as a standalone layer any agent plugs into.
-
-Product lineage (architecture.md §0, §8):
-- **supermemory** taught the product shape: memory as a standalone layer
-  any agent can plug into over MCP. Instate takes the shape and refuses
-  the architecture — memory here is typed ledger facts with guarantees,
-  not auto-extracted conversation summaries.
-- **Context.dev** taught what makes an API *agent-native*:
-    * a self-describing surface — `instate://about` is the auth.md
-      pattern: any MCP agent curls it and onboards itself with zero
-      human configuration;
-    * resources vs tools with the right primitive per thing (most
-      projects shove everything into tools);
-    * low exit cost — plain Postgres rows, `pg_dump` and you're out.
-
-Transport: stateless Streamable HTTP (JSON-RPC 2.0) — no `Mcp-Session-Id`,
-no sticky sessions, so it sits behind a plain load balancer. Implements
-the stable, widely-implemented surface: `initialize`, `tools/list`,
-`tools/call`, `resources/list`, `resources/read`, `prompts/*`, `ping`.
-
-Deliberate choices (§8):
-- reads split from writes — a host can grant read-only access to an
-  untrusted agent; the write tool is separately capability-gated;
-- every tool declares an OUTPUT schema — callers get typed JSON, not
-  stringified blobs;
-- read tools never write decisions (record=False) — a read stays a read;
-- every tool description carries one EXAMPLE OUTPUT — a docstring for a
-  junior developer, per Anthropic's ACI bar.
-
-The core (instate.core) has zero protocol awareness; this file is the
-only place MCP exists.
+"""Stateless MCP server (Streamable HTTP, JSON-RPC 2.0) over the ledger.
+Reads split from writes (write tool capability-gated); every tool declares
+an output schema; read tools never write decisions.
 """
 
 import json
@@ -53,12 +25,12 @@ PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL = (
 
 
 # ---------------------------------------------------------------------------
-# The self-describing manifest — the Context.dev auth.md pattern
+# Self-describing manifest
 # ---------------------------------------------------------------------------
 
 
 def about_manifest() -> dict[str, Any]:
-    """`instate://about` — an agent reads this and knows everything."""
+    """Capabilities, auth, and guarantees for agents."""
     return {
         "name": "instate",
         "version": SERVER_INFO["version"],
@@ -296,7 +268,7 @@ PROMPT_RECOVERY_DECISION = {
 
 
 # ---------------------------------------------------------------------------
-# Tool implementations — thin wrappers over the protocol-free core
+# Tool implementations over the core
 # ---------------------------------------------------------------------------
 
 
@@ -312,7 +284,7 @@ async def tool_timeline(session, args: dict) -> dict:
     from instate.core.tenant import set_tenant
 
     await set_tenant(session, uuid_mod.UUID(args["merchant_id"]))
-    limit = min(int(args.get("limit", 20)), 100)  # poka-yoke: no 300-row dumps
+    limit = min(int(args.get("limit", 20)), 100)  # cap response rows
     events = await get_timeline(
         session, uuid_mod.UUID(args["merchant_id"]), args["entity_id"], limit=limit
     )
@@ -377,9 +349,7 @@ async def tool_explain(session, args: dict) -> dict:
     from instate.core.models import Decision
     from instate.core.tenant import set_tenant
 
-    # Optional merchant scope closes cross-tenant decision peeking: when
-    # provided, the row must belong to the caller. Without it, the PK
-    # lookup stands (bearer capability model, same as the decision id).
+    # Optional merchant scope enforces tenant isolation when provided.
     merchant_arg = args.get("merchant_id")
     if merchant_arg is not None:
         merchant = uuid_mod.UUID(merchant_arg)
@@ -425,9 +395,7 @@ async def tool_record_event(session, args: dict) -> dict:
         return {"recorded": False, "duplicate": False, "note": bad_id}
     event_type = str(args["event_type"])[:64]
 
-    # Schema-in at ingestion: hostile keys (injected root_cause, PII,
-    # blobs) are stripped before the ledger — the dropped list keeps
-    # the stripping transparent, not silent.
+    # Strip unknown/PII keys before the ledger; report them as dropped_keys.
     clean_payload, dropped = sanitize_payload(args.get("payload"))
     try:
         event = await record_event(
@@ -446,8 +414,7 @@ async def tool_record_event(session, args: dict) -> dict:
             result["dropped_keys"] = dropped
         return result
     except DuplicateEventError:
-        # A double-calling agent cannot double-write — and a redelivery
-        # is a success story (the ledger's UNIQUE constraint held)
+        # Dedupe held — idempotency_key already recorded.
         await session.rollback()
         return {
             "recorded": False,
@@ -468,7 +435,7 @@ WRITES_ALLOWED = {"instate_record_event"}
 
 
 async def read_resource(session, uri: str) -> dict:
-    """resources/read — the right primitive for state that deserves caching."""
+    """Read a resource by URI."""
     if uri == "instate://about":
         return about_manifest()
 
@@ -545,11 +512,10 @@ def create_mcp_app(
     allow_writes: bool = False,
     rate_limits: RateLimits | None = None,
 ):
-    """Stateless MCP server over Streamable HTTP (JSON-RPC 2.0).
+    """Stateless MCP server over Streamable HTTP.
 
-    api_key:    when set, every POST must carry `Authorization: Bearer <key>`
-    allow_writes: when False, the write tool refuses — reads split from writes
-    rate_limits: per-merchant token buckets on tools/call (the ops layer)
+    api_key: require Bearer auth when set; allow_writes gates the write
+    tool; rate_limits are per-merchant buckets on tools/call.
     """
     from fastapi import FastAPI, Request, Response
 
@@ -614,7 +580,7 @@ def create_mcp_app(
                         "isError": True,
                     },
                 }
-            # Per-merchant rate limit (the ops layer, §10)
+            # Per-merchant rate limit.
             merchant = args.get("merchant_id", "anonymous")
             bucket_ok = (
                 limits.allow_write(merchant)
@@ -715,7 +681,7 @@ def create_mcp_app(
 
     @rpc_app.post("/mcp")
     async def mcp_endpoint(request: Request) -> Response:
-        # Surface auth (§10: API key minimum)
+        # Bearer auth when api_key is set.
         if api_key is not None:
             auth = request.headers.get("Authorization", "")
             if auth != f"Bearer {api_key}":

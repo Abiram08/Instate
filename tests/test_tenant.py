@@ -1,11 +1,4 @@
-"""Tenant isolation — RLS as code + application guard (§15).
-
-Postgres RLS is the hard wall (fail-closed without `set_tenant`); on
-SQLite the app's WHERE clauses are the guard. These tests pin both:
-the DDL shape, the session helper's safety, and — the property a
-judge will actually ask to see — merchant B observing NOTHING of
-merchant A's ledger through any surface.
-"""
+"""Tenant isolation across ledger and surfaces."""
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,16 +12,12 @@ from tests.conftest import make_merchant_id, now_utc
 
 
 async def test_set_tenant_is_safe_noop_on_sqlite(session: AsyncSession):
-    """set_tenant must never raise where RLS doesn't exist — surfaces
-    call it unconditionally."""
     merchant = make_merchant_id()
-    await set_tenant(session, merchant)  # must not raise
-    await set_tenant(session, str(merchant))  # str form too
+    await set_tenant(session, merchant)
+    await set_tenant(session, str(merchant))
 
 
 async def test_rls_ddl_is_fail_closed():
-    """The policy uses bare current_setting() — no permissive fallback.
-    A session with no tenant set ERRORS on PG instead of leaking."""
     ddl = rls_ddl()
     assert ddl, "RLS DDL must not be empty"
     joined = "\n".join(ddl)
@@ -59,8 +48,6 @@ async def _seed_merchant_a(session: AsyncSession):
 
 
 async def test_merchant_b_sees_nothing_of_a(session: AsyncSession):
-    """The isolation property: B's timeline over A's entity is empty,
-    and B's gate chain reports observed=0 — no events, no counts leak."""
     from instate.core.gate import evaluate
     from instate.core.ledger import get_timeline
     from instate.core.policy import seed_default_policy
@@ -84,11 +71,10 @@ async def test_merchant_b_sees_nothing_of_a(session: AsyncSession):
     )
     assert result.verdict == "ALLOW"
     entry = next(e for e in result.reason_chain if e["rule_id"] == "retry_ceiling_7d")
-    assert entry["observed"] == 0  # A's 1 failure is invisible to B
+    assert entry["observed"] == 0
 
 
 async def test_mcp_timeline_as_other_merchant_is_empty(session: AsyncSession):
-    """Same property through the MCP surface (which sets the tenant)."""
     merchant_a, _ = await _seed_merchant_a(session)
     merchant_b = make_merchant_id()
 
@@ -100,7 +86,6 @@ async def test_mcp_timeline_as_other_merchant_is_empty(session: AsyncSession):
 
 
 async def test_mcp_explain_rejects_mismatched_merchant(session: AsyncSession):
-    """Cross-tenant decision peeking is closed when the caller scopes it."""
     merchant_a, decision_id = await _seed_merchant_a(session)
     merchant_b = make_merchant_id()
 
@@ -110,14 +95,11 @@ async def test_mcp_explain_rejects_mismatched_merchant(session: AsyncSession):
             {"decision_id": decision_id, "merchant_id": str(merchant_b)},
         )
 
-    # Unscoped (legacy) lookup still resolves — bearer capability model
     out = await tool_explain(session, {"decision_id": decision_id})
     assert out["decision"]["id"] == decision_id
 
 
 async def test_mcp_resource_state_as_other_merchant_is_unknown(session: AsyncSession):
-    """B reading A's entity-state resource gets 'unknown entity' —
-    the PK lookup finds nothing under B's key."""
     from instate.core.projection import fold_events
 
     merchant_a, _ = await _seed_merchant_a(session)
@@ -130,10 +112,7 @@ async def test_mcp_resource_state_as_other_merchant_is_unknown(session: AsyncSes
 
 
 async def test_assert_tenant_scope_helper(session: AsyncSession):
-    """The debug helper flags unscoped reads (all rows vs scoped rows)."""
     merchant_a, _ = await _seed_merchant_a(session)
-    # Scoped to A with only A's rows present → passes
     await assert_tenant_scope(session, merchant_a, Event.__table__)
-    # Scoped to B while A's rows exist → raises
     with pytest.raises(AssertionError):
         await assert_tenant_scope(session, make_merchant_id(), Event.__table__)

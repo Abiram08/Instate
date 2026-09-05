@@ -1,4 +1,4 @@
-"""Vault — secrets with rotation and file-backed reads (§15)."""
+"""Vault secrets with rotation and file reads."""
 
 import os
 
@@ -29,15 +29,11 @@ def test_rotate_updates_immediately():
     v.set("INSTATE_TEST_ROT", "old")
     v.rotate("INSTATE_TEST_ROT", "new")
     assert v.get("INSTATE_TEST_ROT") == "new"
-    # rotation writes through to the process env so fresh readers see it
     assert os.environ["INSTATE_TEST_ROT"] == "new"
     del os.environ["INSTATE_TEST_ROT"]
 
 
 def test_file_backed_secret_beats_env(tmp_path):
-    """Docker-secrets style: <KEY>_FILE wins over the env var, so real
-    secrets never need to live in the process environment (invisible
-    to `ps aux`)."""
     secret_file = tmp_path / "razorpay_key"
     secret_file.write_text("file-secret-value\n")
     os.environ["INSTATE_TEST_FILE_KEY"] = "env-value"

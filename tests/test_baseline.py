@@ -1,10 +1,4 @@
-"""Tests for the fair stateless baseline.
-
-The baseline shares everything with the Instate agent except memory —
-these tests pin what its LACK of memory produces: retries past the
-ceiling, model calls on every decision, unbounded context, and no gate
-evidence.
-"""
+"""Stateless baseline behavior without memory."""
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,7 +59,7 @@ async def events_of(session, merchant, entity_id):
 
 
 async def at_ceiling_event(session, merchant, entity_id):
-    """An entity with 3 retries in the last week (at its ceiling)."""
+    """Seed 3 retries in the last week (at ceiling)."""
     for i in range(3):
         await record_event(
             session,
@@ -92,8 +86,6 @@ async def at_ceiling_event(session, merchant, entity_id):
 
 
 async def test_baseline_retries_past_the_ceiling(session: AsyncSession):
-    """THE violation: at the ceiling with 3 fresh failures in the ledger,
-    the baseline retries anyway — no stopping rule exists to stop it."""
     merchant = make_merchant_id()
     await seed_all(session)
     event = await at_ceiling_event(session, merchant, "base_ceil")
@@ -104,11 +96,10 @@ async def test_baseline_retries_past_the_ceiling(session: AsyncSession):
 
     assert result.executed_action == "RETRY_NOW"
     types = await events_of(session, merchant, "base_ceil")
-    assert types.count("RetryAttempted") == 4  # the 4th, past the ceiling
+    assert types.count("RetryAttempted") == 4
 
 
 async def test_baseline_calls_the_model_every_time(session: AsyncSession):
-    """Zero-token rate: 0%. Every decision pays the model."""
     merchant = make_merchant_id()
     await seed_all(session)
     event = await at_ceiling_event(session, merchant, "base_model")
@@ -118,10 +109,8 @@ async def test_baseline_calls_the_model_every_time(session: AsyncSession):
     await agent.process_failure(session, event=event)
     await session.commit()
 
-    assert len(reasoner.contexts) == 1  # one decision, one call — always
+    assert len(reasoner.contexts) == 1
 
-    # and a fraud failure — which the gated agent resolves at zero tokens —
-    # still costs a model call here
     event2 = await record_event(
         session,
         merchant_id=merchant,
@@ -135,17 +124,13 @@ async def test_baseline_calls_the_model_every_time(session: AsyncSession):
     await session.commit()
     result = await agent.process_failure(session, event=event2)
     await session.commit()
-    # the model chose ESCALATE (decent) — but it still had to be ASKED
     assert result.llm_called is True
 
 
 async def test_baseline_context_is_unbounded(session: AsyncSession):
-    """Context rot, measured: the baseline's context grows with history —
-    the bounded digest is the memory layer's product."""
     merchant = make_merchant_id()
     await seed_all(session)
 
-    # 12 events of history
     for i in range(12):
         await record_event(
             session,
@@ -177,16 +162,12 @@ async def test_baseline_context_is_unbounded(session: AsyncSession):
     result = await agent.process_failure(session, event=event)
     await session.commit()
 
-    # 13 events × ~90 chars each — the dump carries everything
     assert result.context_chars > 800
-    # and the model saw every one of them
     sent = reasoner.contexts[0]
     assert len(sent["history"]) == 13
 
 
 async def test_baseline_has_no_gate_evidence(session: AsyncSession):
-    """The baseline's decision rows carry no gate chains — there were no
-    gates. 'Explainable' is a feature of the memory layer, not the model."""
     merchant = make_merchant_id()
     await seed_all(session)
     event = await at_ceiling_event(session, merchant, "base_nogate")
@@ -198,13 +179,11 @@ async def test_baseline_has_no_gate_evidence(session: AsyncSession):
     result = await session.execute(select(Decision).where(Decision.entity_id == "base_nogate"))
     decision = result.scalar_one()
     assert decision.gate1 is None and decision.gate2 is None
-    assert decision.prompt_text is not None  # the full raw dump
+    assert decision.prompt_text is not None
     assert len(decision.prompt_text) > 400
 
 
 async def test_baseline_still_uses_the_outbox(session: AsyncSession):
-    """Fairness detail: execution discipline is NOT the variable under
-    test — the baseline gets the same intent/commit pattern."""
     merchant = make_merchant_id()
     await seed_all(session)
     event = await at_ceiling_event(session, merchant, "base_outbox")

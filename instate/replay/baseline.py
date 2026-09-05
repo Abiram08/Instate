@@ -1,22 +1,5 @@
-"""The stateless baseline — the fair comparison agent (§11).
-
-"Build the baseline FAIR, not as a strawman. A judge who spots a rigged
-comparison discounts every other number you present."
-
-Fair means it shares everything except the variable under test:
-
-  SHARED with the Instate agent:            MISSING (deliberately):
-  - the same diagnosis map                  - Gate-1 (no stopping rules)
-  - the same model (same enum proposal)     - Gate-2 (no re-check, no DNC)
-  - the same action taxonomy defaults       - precedent recall
-  - the same outbox execution discipline    - bounded context: it re-derives
-  - the same ledger event types               the FULL raw history every
-                                              decision (context rot)
-
-So the measured deltas — compliance violations, duplicate retries,
-tokens per decision, zero-LLM rate — are attributable to the memory
-layer alone, exactly the demo's claim.
-"""
+"""Stateless baseline for comparison: same diagnosis map, model, taxonomy, gateway, ledger.
+Omits Gate-1/Gate-2, precedent, and bounded context; re-derives full raw history each decision."""
 
 import json
 from dataclasses import dataclass
@@ -57,9 +40,7 @@ class BaselineResult:
 
 
 class StatelessBaselineAgent:
-    """The same brain, no memory. Every decision starts from scratch:
-    the model sees the entity's ENTIRE raw event history, re-derived and
-    re-sent every time — the context-rot pattern §7 warns about."""
+    """Same model, no memory: re-derives full raw history every decision."""
 
     def __init__(self, reasoner, gateway: PaymentGateway):
         self.reasoner = reasoner
@@ -72,9 +53,7 @@ class StatelessBaselineAgent:
         event: Event,
         now: datetime | None = None,
     ) -> BaselineResult:
-        """Process one failure with no memory — but with the same
-        per-entity serialization as the real pipeline, so the comparison
-        measures memory, not scheduling luck."""
+        """Process one failure with no memory, same per-entity serialization."""
         async with get_entity_lock(event.merchant_id, event.entity_id):
             return await self._process_failure_inner(session, event=event, now=now)
 
@@ -90,11 +69,11 @@ class StatelessBaselineAgent:
         entity_id = event.entity_id
         entity_type = event.entity_type
 
-        # Same deterministic diagnosis map — the map is not the variable
+        # Same diagnosis map as the real pipeline.
         failure_code = (event.payload or {}).get("failure_code")
         root_cause = await diagnose(session, failure_code=failure_code)
 
-        # THE difference: unbounded raw context, re-derived every time.
+        # Unbounded raw context, re-derived every time.
         result = await session.execute(
             select(Event)
             .where(Event.merchant_id == merchant_id, Event.entity_id == entity_id)
@@ -115,8 +94,7 @@ class StatelessBaselineAgent:
         proposal = validate_proposal(raw)
         llm_called = proposal is not None
         if proposal is None:
-            # The stateless default: retry immediately. No policy memory
-            # to fall back on — which is precisely the failure mode.
+            # Default with no memory: retry immediately.
             proposal = {
                 "action": ACTION_RETRY_NOW,
                 "timing": "IMMEDIATE",
@@ -125,14 +103,11 @@ class StatelessBaselineAgent:
             }
 
         usage = getattr(self.reasoner, "last_usage", None)
-        # Token accounting, same convention as the Instate agent: input
-        # cost IS the rendered context — here the FULL raw dump, which
-        # grows with history depth. That growth is the measured flaw.
+        # Input tokens = full rendered context; grows with history depth.
         tokens_in = len(rendered) // 4
         tokens_out = usage[1] if usage else 60
 
-        # A decision row for metrics parity (no gate chains — there were
-        # no gates; prompt_text is the FULL raw dump)
+        # Decision row for metrics parity (no gate chains).
         decision = Decision(
             merchant_id=merchant_id,
             entity_id=entity_id,

@@ -1,20 +1,4 @@
-"""Encryption at rest — payload before it hits the DB (§15).
-
-`EncryptedJSONType` sits on `Event.payload` ONLY (policy rows, reason
-chains and decisions stay plaintext — they hold no PII). It is fully
-transparent to every caller: with no key configured it behaves exactly
-like `JSONType`; with `INSTATE_ENCRYPTION_KEY` set, binds encrypt and
-results decrypt, so the DB file never holds plaintext PII.
-
-Orthogonality to tamper-evidence (the load-bearing detail):
-- the chain hash uses `payload_hash`, computed from the PLAINTEXT in
-  `record_event` BEFORE the column encrypts — encryption cannot break
-  the chain by construction;
-- redaction nulls the ciphertext; `payload_hash` stays; the chain
-  still verifies; reads of a redacted row return None — which every
-  payload consumer already handles (`diagnose`, `_lite_payload`,
-  console rendering all treat None as absent).
-"""
+"""Encrypted event payloads at rest (§15). Chain hashes plaintext payload_hash; no key behaves as plain JSON."""
 
 import base64
 import hashlib
@@ -56,10 +40,7 @@ def get_fernet():
 
 
 class EncryptedJSONType(TypeDecorator[dict[str, Any]]):
-    """JSON-at-rest with optional encryption. Standalone (no import from
-    models — models.py imports THIS for Event.payload, so sharing the
-    JSONType base would be a cycle; the dialect handling is duplicated
-    deliberately and documented here)."""
+    """JSON with optional encryption. Duplicates JSONType dialect handling to avoid a models import cycle."""
 
     impl = Text  # type: ignore[assignment]
     cache_ok = True
@@ -106,13 +87,7 @@ class EncryptedJSONType(TypeDecorator[dict[str, Any]]):
 
 
 def decrypt_payload(stored) -> dict | None:
-    """Read-contract for a stored payload value.
-
-    None (redacted or absent) → None. This is the documented semantic a
-    judge will ask about: redaction deletes content, never evidence —
-    the chain verifies off `payload_hash`, and every consumer treats a
-    None payload as absent, not as broken.
-    """
+    """Read stored payload; None (redacted/absent) → None. Chain verifies off payload_hash."""
     if stored is None:
         return None
     if isinstance(stored, dict) and "_enc" not in stored:

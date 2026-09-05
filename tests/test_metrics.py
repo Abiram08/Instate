@@ -1,9 +1,4 @@
-"""Tests for the metrics — every demo claim computed from the ledger.
-
-Nothing here trusts an agent's self-report: money comes from event
-payloads, violations from a chronological scan, tokens from the
-decisions table, integrity from the hash chain.
-"""
+"""Ledger-derived run metrics (money, compliance, tokens, integrity)."""
 
 from datetime import timedelta
 
@@ -22,7 +17,6 @@ from tests.conftest import days_ago, hours_ago, make_merchant_id, now_utc
 
 
 async def test_money_flow_nets_refunds(session: AsyncSession):
-    """gross − reversed = net: the headline must not overstate."""
     merchant = make_merchant_id()
     await record_event(
         session,
@@ -62,7 +56,7 @@ async def test_money_flow_nets_refunds(session: AsyncSession):
 
 
 async def test_scan_compliance_catches_the_fourth_retry(session: AsyncSession):
-    """3 retries inside the window are legitimate; the 4th violates."""
+    """Pins 3 allowed in window; 4th violates."""
     merchant = make_merchant_id()
     for i in range(4):
         await record_event(
@@ -77,7 +71,7 @@ async def test_scan_compliance_catches_the_fourth_retry(session: AsyncSession):
     await session.commit()
 
     retries, contacts = await scan_compliance(session, merchant_id=merchant)
-    assert retries == 1  # only the 4th attempt
+    assert retries == 1
 
 
 async def test_scan_compliance_catches_contact_flood(session: AsyncSession):
@@ -96,12 +90,11 @@ async def test_scan_compliance_catches_contact_flood(session: AsyncSession):
     await session.commit()
 
     retries, contacts = await scan_compliance(session, merchant_id=merchant)
-    assert contacts == 2  # the 3rd and 4th contacts
+    assert contacts == 2
 
 
 async def test_scan_compliance_window_edges(session: AsyncSession):
-    """Retries outside the 7-day window don't stack — the scanner ages
-    its counters exactly like the gates do."""
+    """Pins 7-day window expiry."""
     merchant = make_merchant_id()
     for i, back in enumerate([10, 9, 8, 1, 0.5]):
         await record_event(
@@ -116,7 +109,7 @@ async def test_scan_compliance_window_edges(session: AsyncSession):
     await session.commit()
 
     retries, _ = await scan_compliance(session, merchant_id=merchant)
-    assert retries == 0  # old attempts expired; only 2 are in-window
+    assert retries == 0
 
 
 async def test_scan_compliance_entity_isolation(session: AsyncSession):
@@ -143,15 +136,13 @@ async def test_scan_compliance_entity_isolation(session: AsyncSession):
     await session.commit()
 
     retries, _ = await scan_compliance(session, merchant_id=merchant)
-    assert retries == 1  # A's 4th; B's single attempt is clean
+    assert retries == 1
 
 
 async def test_compute_run_metrics_full_picture(session: AsyncSession):
     merchant = make_merchant_id()
-    # one zero-llm decision, one modeled decision
     session.add(Decision(merchant_id=merchant, entity_id="e1"))
     session.add(Decision(merchant_id=merchant, entity_id="e2", tokens_in=900, tokens_out=60))
-    # money + a violation
     await record_event(
         session,
         merchant_id=merchant,
@@ -179,7 +170,7 @@ async def test_compute_run_metrics_full_picture(session: AsyncSession):
     assert m.decisions == 2
     assert m.zero_llm_decisions == 1
     assert m.zero_llm_share == 0.5
-    assert m.avg_input_tokens == 450  # amortized: 900 / 2 decisions (zero counts as 0)
+    assert m.avg_input_tokens == 450
     assert m.gross_recovered_minor == 49900
     assert m.net_recovered_minor == 49900
     assert m.retry_violations == 1
@@ -216,8 +207,8 @@ def test_format_comparison_rows():
     )
     table = format_comparison(baseline, instate)
 
-    assert "₹400" in table  # baseline net: 40000 minor
-    assert "₹500" in table  # instate net: 50000 minor
-    assert "0%" in table  # baseline zero-llm share
-    assert "75%" in table  # instate zero-llm share (3 of 4)
-    assert "yes" in table  # chains verified
+    assert "₹400" in table
+    assert "₹500" in table
+    assert "0%" in table
+    assert "75%" in table
+    assert "yes" in table

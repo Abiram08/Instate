@@ -1,8 +1,4 @@
-"""HITL queue — assignment, SLA, resolution writes back to L0 (§15).
-
-Escalations are not dead-ends: a human resolves, the resolution event
-feeds L3, so the memory learns from people.
-"""
+"""HITL queue: assignment, SLA, resolution writes back to L0 (§15)."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -38,13 +34,7 @@ async def enqueue_escalation(
     reason: str,
     sla_hours: int = 24,
 ) -> HitlTask | None:
-    """Enqueue a human task — unless the entity is already terminal.
-
-    A RECOVERED (or WRITTEN_OFF) entity has nothing to escalate: without
-    this guard the task would sit `open` forever, breach SLA, and a later
-    resolve would write a phantom second HumanResolved. Returns None
-    when there is nothing to escalate.
-    """
+    """Enqueue a human task unless the entity is terminal. Returns None when nothing to escalate."""
     if await _current_status(session, merchant_id, entity_id) in TERMINAL_STATUSES:
         return None
     task = HitlTask(
@@ -77,13 +67,7 @@ async def resolve_task(
     action: str,
     payload: dict | None = None,
 ) -> HitlTask | None:
-    """Human resolves: write back to L0 (HumanResolved / PromiseMade etc.)
-    so L3 precedent captures it.
-
-    Race-safe: if the entity reached a terminal status between enqueue
-    and resolve (e.g. a scheduled retry landed first), the task still
-    closes — but as an explicit no-op, with NO duplicate ledger event.
-    """
+    """Resolve task and write back to L0. Terminal entities close as no-op with no duplicate event."""
     task = await session.get(HitlTask, task_id)
     if task is None or task.status not in ("open", "claimed"):
         return None
@@ -100,7 +84,6 @@ async def resolve_task(
     task.resolution_payload = payload or {}
     task.updated_at = datetime.now(UTC)
 
-    # Write-back: the human outcome becomes a ledger event
     event_type = {"recovered": "HumanResolved", "promise": "PromiseMade"}.get(action, "HumanResolved")
     await record_event(
         session,
@@ -113,7 +96,6 @@ async def resolve_task(
         source_event_id=f"hitl_{task.id}_resolved",
         decision_id=task.decision_id,
     )
-    # fold to update L1
     await session.flush()
     await fold_events(session)
     await session.flush()

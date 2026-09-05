@@ -1,20 +1,7 @@
-"""Payload sanitation at ingestion (§10: schema-in, junk never reaches L0).
+"""Payload sanitation at ingress; record_event stays unsanitized (§10).
 
-`record_event` itself stays unsanitized on purpose: the hash is a pure
-function of the exact payload, and the determinism test pins that
-contract. Sanitation lives at the two INGRESS points instead — the
-webhook receiver and the MCP write tool — where merchant-controlled
-bytes first touch the system.
-
-Why: an untrusted payload key can poison downstream logic. `diagnose`
-reads `failure_code`; precedent summaries embed situation text; the
-console renders payloads. A hostile `{"root_cause": "fraud_block"}`
-must never steer a gate, and a 10 MB `{"note": ...}` must never bloat
-a stored row. Note `root_cause` is deliberately ABSENT from the
-whitelist: it is derived by `diagnose`, never asserted by callers.
-
-Returns (clean_payload, dropped_keys) — callers surface the dropped
-keys so stripping is transparent, not silent.
+Hash is over the exact payload (determinism); root_cause is derived by
+diagnose, never asserted — hence absent from the whitelist.
 """
 
 MAX_STR_LEN = 256
@@ -32,16 +19,19 @@ INGEST_PAYLOAD_KEYS: dict[str, tuple[type, int | None]] = {
     "razorpay_event": (str, 64),
     "source_event_id": (str, 256),
     "success": (bool, None),
+    # Real Razorpay entity context (docs/webhooks/payments) — flat scalars
+    # for the ledger timeline; all bounded, all optional.
+    "method": (str, 32),
+    "order_id": (str, 64),
+    "status": (str, 32),
+    "error_code": (str, 128),
 }
 
 
 def sanitize_payload(payload: dict | None) -> tuple[dict | None, list[str]]:
-    """Whitelist + type-check an ingress payload.
+    """Whitelist and type-check an ingress payload; no coercion.
 
-    Unknown keys are dropped. Wrong types are dropped (no coercion —
-    coercion is how "0" becomes 0 and bypasses a check). Overlong
-    strings are dropped, not truncated (truncation can silently change
-    a code's meaning). Negative amounts are dropped.
+    Unknown keys, wrong types, overlong strings, and negative amounts drop.
     """
     if payload is None:
         return None, []

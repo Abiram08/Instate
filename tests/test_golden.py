@@ -1,10 +1,4 @@
-"""Tests for the golden-set evaluation (build item 13, §11).
-
-The measured claim: the SYSTEM lands on the right action even when the
-model is wrong. The golden set runs the real pipeline with scripted
-models — including deliberately naive ones — and the accuracy number
-comes from the gates, the taxonomy, and the hard-decline rule.
-"""
+"""Golden-set evaluation of pipeline accuracy."""
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,9 +27,6 @@ def reasoner_factory(case):
 
 
 async def test_golden_set_all_pass(session: AsyncSession):
-    """Every gate in the system, exercised by name — accuracy 100% with
-    the naive model deliberately trying to retry dead cards and
-    ceilinged entities."""
     merchant = make_merchant_id()
     results = await evaluate_golden_set(
         session,
@@ -57,8 +48,6 @@ async def test_golden_set_all_pass(session: AsyncSession):
 
 
 async def test_golden_zero_llm_cases_stay_zero(session: AsyncSession):
-    """The ceiling/fraud/mandate cases must resolve without the model —
-    checked as part of the pass criteria."""
     merchant = make_merchant_id()
     results = await evaluate_golden_set(
         session,
@@ -78,8 +67,6 @@ async def test_golden_zero_llm_cases_stay_zero(session: AsyncSession):
 
 
 async def test_golden_hard_decline_case_vetoed_the_retry(session: AsyncSession):
-    """The flagship: the model said RETRY_NOW on an expired card, the
-    system escalated instead — the veto is visible in the result."""
     merchant = make_merchant_id()
     results = await evaluate_golden_set(
         session,

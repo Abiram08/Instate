@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-instate = "instate.cli.main:app"
+instate = "instate.surfaces.cli:app"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

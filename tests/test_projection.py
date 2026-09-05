@@ -1,9 +1,4 @@
-"""Tests for L1 projection — fold, rebuild, windowed counts.
-
-These tests verify the stopping-rule boundaries hard (build-order item 2:
-"unit-test the stopping-rule boundaries hard") — the exact boundaries
-where Gate-1 would fire are the correctness-critical edges.
-"""
+"""L1 projection tests: fold, rebuild, and windowed counts."""
 
 from datetime import timedelta
 
@@ -98,7 +93,6 @@ async def test_fold_promise_lifecycle(session: AsyncSession):
     assert state.status == "AWAITING_PROMISE"
     assert state.open_ptp_due_at is not None
 
-    # Promise honored
     await record_event(
         session, merchant_id=merchant, entity_id="sub_ptp", entity_type="subscription",
         event_type="PromiseHonored", occurred_at=base + timedelta(days=3),
@@ -134,7 +128,6 @@ async def test_fold_contacts_set_last_contact_at(session: AsyncSession):
 
     state = await session.get(EntityState, (merchant, "sub_contact"))
     assert state.last_contact_at is not None
-    # last_contact_at should be the occurred_at of the contact event
     assert abs((state.last_contact_at - contact_time).total_seconds()) < 1
 
 
@@ -143,7 +136,6 @@ async def test_fold_is_incremental(session: AsyncSession):
     merchant = make_merchant_id()
     base = now_utc()
 
-    # First batch
     for i in range(3):
         await record_event(
             session, merchant_id=merchant, entity_id="sub_incr", entity_type="subscription",
@@ -158,7 +150,6 @@ async def test_fold_is_incremental(session: AsyncSession):
     state1 = await session.get(EntityState, (merchant, "sub_incr"))
     watermark1 = state1.last_event_id
 
-    # Second batch — only new events should be folded
     for i in range(3, 5):
         await record_event(
             session, merchant_id=merchant, entity_id="sub_incr", entity_type="subscription",
@@ -168,7 +159,7 @@ async def test_fold_is_incremental(session: AsyncSession):
 
     folded2 = await fold_events(session)
     await session.commit()
-    assert folded2 == 2  # only the 2 new events
+    assert folded2 == 2
 
     state2 = await session.get(EntityState, (merchant, "sub_incr"))
     assert state2.last_event_id > watermark1
@@ -184,7 +175,6 @@ async def test_rebuild_produces_identical_state(session: AsyncSession):
     merchant = make_merchant_id()
     base = now_utc()
 
-    # Build a rich event history
     events_spec = [
         ("PaymentFailed", 0, {"amount_minor": 50000, "root_cause": "card_expired"}),
         ("FailureDiagnosed", 1, {"root_cause": "card_expired"}),
@@ -201,11 +191,9 @@ async def test_rebuild_produces_identical_state(session: AsyncSession):
         )
     await session.commit()
 
-    # First fold
     await fold_events(session)
     await session.commit()
 
-    # Rebuild
     result = await rebuild(session)
     await session.commit()
 
@@ -235,7 +223,6 @@ async def test_windowed_count_within_window(session: AsyncSession):
     """Events within the window are counted."""
     merchant = make_merchant_id()
 
-    # 3 retries in the last 24 hours
     for i in range(3):
         await record_event(
             session, merchant_id=merchant, entity_id="sub_wc", entity_type="subscription",
@@ -253,7 +240,6 @@ async def test_windowed_count_excludes_old_events(session: AsyncSession):
     """Events outside the window are NOT counted (the window ages out)."""
     merchant = make_merchant_id()
 
-    # 2 retries within 7 days
     await record_event(
         session, merchant_id=merchant, entity_id="sub_wc2", entity_type="subscription",
         event_type="RetryAttempted", occurred_at=hours_ago(12),
@@ -262,7 +248,7 @@ async def test_windowed_count_excludes_old_events(session: AsyncSession):
         session, merchant_id=merchant, entity_id="sub_wc2", entity_type="subscription",
         event_type="RetryAttempted", occurred_at=days_ago(2),
     )
-    # 1 retry 10 days ago (outside the 7-day window)
+    # 10 days ago: outside the 7-day window.
     await record_event(
         session, merchant_id=merchant, entity_id="sub_wc2", entity_type="subscription",
         event_type="RetryAttempted", occurred_at=days_ago(10),
@@ -272,14 +258,13 @@ async def test_windowed_count_excludes_old_events(session: AsyncSession):
     count = await get_windowed_count(
         session, merchant, "sub_wc2", "retry_count_7d", timedelta(days=7)
     )
-    assert count == 2  # only the ones within 7 days
+    assert count == 2
 
 
 async def test_windowed_count_contacts_24h(session: AsyncSession):
     """contacts_24h counts contact events within 24 hours."""
     merchant = make_merchant_id()
 
-    # 2 contacts in the last 24 hours
     await record_event(
         session, merchant_id=merchant, entity_id="sub_wc3", entity_type="subscription",
         event_type="CustomerContacted", occurred_at=hours_ago(3),
@@ -289,7 +274,7 @@ async def test_windowed_count_contacts_24h(session: AsyncSession):
         session, merchant_id=merchant, entity_id="sub_wc3", entity_type="subscription",
         event_type="PaymentLinkSent", occurred_at=hours_ago(10),
     )
-    # 1 contact 2 days ago (outside 24h window)
+    # 2 days ago: outside the 24h window.
     await record_event(
         session, merchant_id=merchant, entity_id="sub_wc3", entity_type="subscription",
         event_type="CustomerContacted", occurred_at=days_ago(2),
@@ -304,8 +289,7 @@ async def test_windowed_count_contacts_24h(session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
-# Stopping-rule boundaries — the correctness-critical edges
-# (build order item 2: "unit-test the stopping-rule boundaries hard")
+# Stopping-rule boundaries
 # ---------------------------------------------------------------------------
 
 
@@ -313,7 +297,6 @@ async def test_stopping_rule_boundary_at_limit(session: AsyncSession):
     """Exactly at the limit (3 retries in 7d) → count == 3 → Gate-1 would DENY."""
     merchant = make_merchant_id()
 
-    # Exactly 3 retries within 7 days
     for i in range(3):
         await record_event(
             session, merchant_id=merchant, entity_id="sub_boundary", entity_type="subscription",
@@ -324,7 +307,7 @@ async def test_stopping_rule_boundary_at_limit(session: AsyncSession):
     count = await get_windowed_count(
         session, merchant, "sub_boundary", "retry_count_7d", timedelta(days=7)
     )
-    assert count == 3  # at the limit: observed >= limit → DENY
+    assert count == 3
 
 
 async def test_stopping_rule_boundary_below_limit(session: AsyncSession):
@@ -341,14 +324,14 @@ async def test_stopping_rule_boundary_below_limit(session: AsyncSession):
     count = await get_windowed_count(
         session, merchant, "sub_boundary2", "retry_count_7d", timedelta(days=7)
     )
-    assert count == 2  # below the limit: observed < limit → ALLOW
+    assert count == 2
 
 
 async def test_stopping_rule_boundary_exactly_at_window_edge(session: AsyncSession):
     """An event at exactly the window edge — the boundary of the boundary."""
     merchant = make_merchant_id()
 
-    # One retry exactly 7 days ago minus a minute (just inside the window)
+    # Just inside the 7-day window.
     await record_event(
         session, merchant_id=merchant, entity_id="sub_edge", entity_type="subscription",
         event_type="RetryAttempted", occurred_at=days_ago(7) + timedelta(minutes=1),
@@ -358,7 +341,7 @@ async def test_stopping_rule_boundary_exactly_at_window_edge(session: AsyncSessi
     count = await get_windowed_count(
         session, merchant, "sub_edge", "retry_count_7d", timedelta(days=7)
     )
-    assert count == 1  # just inside the window
+    assert count == 1
 
 
 async def test_stopping_rule_dedupe_doesnt_double_count(session: AsyncSession):
@@ -366,7 +349,6 @@ async def test_stopping_rule_dedupe_doesnt_double_count(session: AsyncSession):
     merchant = make_merchant_id()
     from instate.core.ledger import DuplicateEventError
 
-    # First delivery
     await record_event(
         session, merchant_id=merchant, entity_id="sub_dbl", entity_type="subscription",
         event_type="RetryAttempted", occurred_at=hours_ago(1),
@@ -374,7 +356,6 @@ async def test_stopping_rule_dedupe_doesnt_double_count(session: AsyncSession):
     )
     await session.commit()
 
-    # Redelivery — should be inert
     with pytest.raises(DuplicateEventError):
         await record_event(
             session, merchant_id=merchant, entity_id="sub_dbl", entity_type="subscription",
@@ -386,7 +367,7 @@ async def test_stopping_rule_dedupe_doesnt_double_count(session: AsyncSession):
     count = await get_windowed_count(
         session, merchant, "sub_dbl", "retry_count_7d", timedelta(days=7)
     )
-    assert count == 1  # counted once, not twice
+    assert count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -398,13 +379,11 @@ async def test_windowed_count_entity_isolation(session: AsyncSession):
     """Counts are per-entity — entity A's retries don't count for entity B."""
     merchant = make_merchant_id()
 
-    # Entity A: 3 retries
     for i in range(3):
         await record_event(
             session, merchant_id=merchant, entity_id="entity_A", entity_type="subscription",
             event_type="RetryAttempted", occurred_at=hours_ago(i + 1),
         )
-    # Entity B: 1 retry
     await record_event(
         session, merchant_id=merchant, entity_id="entity_B", entity_type="subscription",
         event_type="RetryAttempted", occurred_at=hours_ago(1),

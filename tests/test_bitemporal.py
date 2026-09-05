@@ -1,12 +1,4 @@
-"""Bi-temporal frozen decisions (§1b).
-
-The compliance question is "was this decision correct given what we knew
-at the time?" — so re-evaluating a past decision must reproduce its
-verdict EXACTLY, even after a late-arriving event lands. The mechanism:
-`as_of` pins the knowledge cutoff (`recorded_at <= as_of`) alongside
-the window anchor (`now`). A late event (old occurred_at, new
-recorded_at) affects only future decisions — never rewrites a past one.
-"""
+"""Bi-temporal frozen decisions via as_of knowledge cutoff."""
 
 from datetime import timedelta
 
@@ -21,12 +13,7 @@ from tests.conftest import make_merchant_id, now_utc
 
 
 async def _backdate_recorded(session: AsyncSession, source_id: str, when):
-    """Test-only time travel: pretend a row was LEARNED at `when`.
-
-    recorded_at is not part of the chain hash, so this cannot break
-    verification — it only changes archive/replay eligibility, which is
-    exactly what these tests exercise.
-    """
+    """Backdate recorded_at (excluded from chain hash)."""
     await session.execute(
         update(Event).where(Event.source_event_id == source_id).values(recorded_at=when)
     )
@@ -39,10 +26,7 @@ async def test_late_arrival_does_not_rewrite_a_past_decision(session: AsyncSessi
     base = now_utc()
     t0 = base - timedelta(days=5)
 
-    # Two retries, learned when they happened. Placed at t0-40h and
-    # t0-30h: inside T0's 7d ceiling window (2/3 → ALLOW), outside its
-    # 24h spacing window (spacing stays quiet), AND strictly inside the
-    # live window at base (so the live re-check below can reach 3).
+    # 2 retries at t0-40h/30h: inside 7d ceiling, outside 24h spacing.
     for i, back in enumerate([timedelta(hours=40), timedelta(hours=30)]):
         await record_event(
             session, merchant_id=merchant, entity_id="sub_frozen",
@@ -53,7 +37,6 @@ async def test_late_arrival_does_not_rewrite_a_past_decision(session: AsyncSessi
     await _backdate_recorded(session, "frozen_r0", t0 - timedelta(hours=40))
     await _backdate_recorded(session, "frozen_r1", t0 - timedelta(hours=30))
 
-    # The original decision at T0: 2/3 → ALLOW, recorded
     d1 = await evaluate(
         session, merchant_id=merchant, entity_id="sub_frozen",
         entity_type="subscription", action_class="RETRY_NOW",
@@ -63,8 +46,6 @@ async def test_late_arrival_does_not_rewrite_a_past_decision(session: AsyncSessi
     assert d1.verdict == "ALLOW"
     assert d1.decision_id is not None
 
-    # LATE arrival: occurred 12h before T0 (inside T0's window!),
-    # but only learned NOW — appends at the chain tail.
     await record_event(
         session, merchant_id=merchant, entity_id="sub_frozen",
         entity_type="subscription", event_type="RetryAttempted",
@@ -72,12 +53,9 @@ async def test_late_arrival_does_not_rewrite_a_past_decision(session: AsyncSessi
     )
     await session.commit()
 
-    # The chain absorbs out-of-order appends without breaking
     check = await verify_chain(session, merchant, "sub_frozen")
     assert check.verified, f"late append must not break the chain: {check.error}"
 
-    # Replaying the decision AS OF T0 reproduces it EXACTLY — the late
-    # event was unknown then, so it does not count.
     replay = await evaluate(
         session, merchant_id=merchant, entity_id="sub_frozen",
         entity_type="subscription", action_class="RETRY_NOW",
@@ -89,8 +67,6 @@ async def test_late_arrival_does_not_rewrite_a_past_decision(session: AsyncSessi
 
 
 async def test_late_arrival_affects_future_decisions(session: AsyncSession):
-    """The other half: once learned, the late event IS live knowledge —
-    a fresh evaluation sees all 3 attempts and DENYs."""
     merchant = make_merchant_id()
     await seed_default_policy(session)
     base = now_utc()
@@ -124,8 +100,6 @@ async def test_late_arrival_affects_future_decisions(session: AsyncSession):
 
 
 async def test_as_of_without_now_still_cuts_knowledge(session: AsyncSession):
-    """as_of alone (live window anchor) still excludes not-yet-learned
-    rows — the two times are independent for a reason."""
     from datetime import timedelta as td
 
     from instate.core.projection import get_windowed_count

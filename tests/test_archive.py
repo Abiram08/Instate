@@ -1,13 +1,4 @@
-"""Cold archive — chain-walkable, window-safe (§15).
-
-Two invariants under test:
-1. The clamp: rows whose occurred_at is still inside a live gate window
-   NEVER leave the hot table, no matter how old their recorded_at is —
-   or Gate-1 would wrongly ALLOW (a compliance breach by housekeeping).
-2. The anchor: after a legitimate cut, cold rows + anchor + hot rows
-   verify as one chain — in-DB and in the standalone verifier. A cut
-   with no (or a tampered) anchor fails honestly.
-"""
+"""Cold archive with chain anchor and gate-window clamp."""
 
 import json
 
@@ -24,11 +15,7 @@ from tests.conftest import days_ago, make_merchant_id, now_utc
 
 
 async def _age_recorded_at(session: AsyncSession, merchant, entity_id: str, days: float):
-    """Test-only surgery: pretend these rows were LEARNED long ago.
-
-    recorded_at is NOT part of the chain hash, so backdating it cannot
-    break verification — it only changes archive eligibility.
-    """
+    """Backdate recorded_at (excluded from chain hash)."""
     await session.execute(
         update(Event)
         .where(Event.merchant_id == merchant, Event.entity_id == entity_id)
@@ -38,11 +25,7 @@ async def _age_recorded_at(session: AsyncSession, merchant, entity_id: str, days
 
 
 async def _seed_old_chain(session, merchant, entity_id: str, *, n_old: int = 3):
-    """Entity with old history + one fresh event.
-
-    Both occurred_at AND recorded_at are backdated for the old rows —
-    the archive cut keys on recorded_at, the clamp on occurred_at.
-    """
+    """Seed old history plus one fresh event."""
     for i in range(n_old):
         await record_event(
             session,
@@ -64,8 +47,6 @@ async def _seed_old_chain(session, merchant, entity_id: str, *, n_old: int = 3):
         source_event_id=f"{entity_id}_new",
     )
     await session.commit()
-    # Age the OLD rows' recorded_at (test-only surgery — recorded_at is
-    # not part of the chain hash, so this cannot break verification).
     await session.execute(
         update(Event)
         .where(
@@ -93,7 +74,6 @@ async def test_archive_keeps_chain_verifiable_via_anchor(session: AsyncSession, 
     assert report["skipped_in_window"] == 0
     assert len(report["files"]) == 1
 
-    # Hot chain starts mid-history — the anchor vouches for the cut link
     result = await verify_chain(session, merchant, "sub_arc")
     assert result.verified, f"anchored chain must verify, got: {result.error}"
     assert result.archived_prefix is True
@@ -101,8 +81,7 @@ async def test_archive_keeps_chain_verifiable_via_anchor(session: AsyncSession, 
 
 
 async def test_archive_clamp_protects_live_gate_window(session: AsyncSession, tmp_path):
-    """Rows LEARNED 100 days ago but OCCURRING 3/2/1 days ago stay hot:
-    the 7d retry window still needs them. The gate must still DENY."""
+    """Pins clamp: occurred_at in 7d window stays hot despite old recorded_at."""
     merchant = make_merchant_id()
     await seed_default_policy(session)  # 7d ceiling is the widest window
 
@@ -124,9 +103,8 @@ async def test_archive_clamp_protects_live_gate_window(session: AsyncSession, tm
     )
 
     assert report["archived"] == 0
-    assert report["skipped_in_window"] == 3  # the clamp is visible, not silent
+    assert report["skipped_in_window"] == 3
 
-    # Functional proof: the gate still sees the full window → DENY
     verdict = await evaluate(
         session,
         merchant_id=merchant,
@@ -140,15 +118,12 @@ async def test_archive_clamp_protects_live_gate_window(session: AsyncSession, tm
 
 
 async def test_tampered_anchor_fails_verify(session: AsyncSession, tmp_path):
-    """An anchor that doesn't vouch for the exact cut link is worthless —
-    verification fails honestly instead of trusting it."""
     merchant = make_merchant_id()
     await seed_default_policy(session)
     await _seed_old_chain(session, merchant, "sub_tamper")
     await session.commit()
     await archive_old_events(session, retention_days=90, export_dir=tmp_path, now=now_utc())
 
-    # Tamper with the anchor (test-only surgery on the trust root)
     await session.execute(
         update(ArchiveAnchor)
         .where(ArchiveAnchor.merchant_id == merchant, ArchiveAnchor.entity_id == "sub_tamper")
@@ -162,8 +137,6 @@ async def test_tampered_anchor_fails_verify(session: AsyncSession, tmp_path):
 
 
 async def test_cut_without_anchor_fails_honestly(session: AsyncSession):
-    """Rows deleted with no anchor (legacy data, manual surgery) are a
-    break — reported as a mismatch, never silently accepted."""
     from sqlalchemy import delete
 
     merchant = make_merchant_id()
@@ -186,8 +159,6 @@ async def test_cut_without_anchor_fails_honestly(session: AsyncSession):
 
 
 async def test_standalone_verifier_accepts_cold_plus_hot(session: AsyncSession, tmp_path):
-    """The bank's auditor path: cold export file + hot rows + anchors
-    verify with zero dependency on our service."""
     merchant = make_merchant_id()
     await seed_default_policy(session)
     await _seed_old_chain(session, merchant, "sub_audit")
@@ -236,12 +207,8 @@ async def test_standalone_verifier_accepts_cold_plus_hot(session: AsyncSession, 
     assert report["verified"], f"auditor path must verify, got: {report['breaks']}"
     assert report["events"] == 4
 
-    # Hot rows alone, no anchor: the cut is a break (the auditor cannot
-    # tell archival from tampering without the anchor — by design)
     hot_only = verify_exported_rows(hot_rows)
     assert hot_only["verified"] is False
 
-    # Hot rows alone WITH the anchor: verifies (the auditor's normal case —
-    # they don't need the whole cold file, just the anchor)
     anchored = verify_exported_rows(hot_rows, anchors=anchor_dicts)
     assert anchored["verified"], f"anchored hot rows must verify, got: {anchored['breaks']}"

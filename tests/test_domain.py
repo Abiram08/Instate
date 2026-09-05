@@ -1,10 +1,4 @@
-"""Tests for the Stage-4 domain hardening (build item 11, §6 Stripe lessons).
-
-The hard-decline method gate is the centerpiece: a money attempt on a
-hard-declined method is denied until a PaymentMethodChanged event lands —
-at Gate-2 for immediate proposals, and at the due-scan for scheduled
-retries. Same rule, both doors.
-"""
+"""Domain hardening: hard-decline method gate at Gate-2 and the due-scan."""
 
 from datetime import timedelta
 
@@ -58,9 +52,7 @@ async def events_of(session, merchant, entity_id):
 
 
 async def test_no_method_evidence_blocks_by_default(session: AsyncSession):
-    """The hard-decline unblock requires EVIDENCE: with no
-    PaymentMethodChanged on file at all, the block stands — even for an
-    entity with no prior failure row."""
+    """No PaymentMethodChanged on file → block stands."""
     merchant = make_merchant_id()
     assert (
         await has_new_method_since_last_failure(session, merchant_id=merchant, entity_id="e_none")
@@ -150,8 +142,7 @@ async def test_no_method_change_since_failure_blocks(session: AsyncSession):
 
 
 async def test_gate2_denies_retry_on_hard_decline(session: AsyncSession):
-    """card_expired + model says RETRY_NOW → the hard-decline rule vetoes
-    it with a reason-chain entry naming the mechanism."""
+    """RETRY_NOW on card_expired → hard-decline veto."""
     merchant = make_merchant_id()
     await seed_all(session)
 
@@ -180,8 +171,7 @@ async def test_gate2_denies_retry_on_hard_decline(session: AsyncSession):
 
 
 async def test_gate2_allows_contact_on_hard_decline(session: AsyncSession):
-    """The rule gates MONEY attempts — a payment link (method update) is
-    exactly what a hard decline needs, and passes."""
+    """Payment link still passes on hard decline."""
     merchant = make_merchant_id()
     await seed_all(session)
 
@@ -236,13 +226,12 @@ async def test_gate2_hard_decline_not_triggered_for_other_causes(session: AsyncS
 
 
 # ---------------------------------------------------------------------------
-# The pipeline — a bad model cannot retry a dead card
+# Pipeline
 # ---------------------------------------------------------------------------
 
 
 async def test_pipeline_blocks_bad_model_retry_on_card_expired(session: AsyncSession):
-    """The model naively proposes RETRY_NOW on card_expired → Gate-2 vetoes
-    → escalate. The hallucination cannot reach Razorpay."""
+    """Naive RETRY_NOW on card_expired → escalate, gateway untouched."""
     merchant = make_merchant_id()
     await seed_all(session)
 
@@ -281,8 +270,7 @@ async def test_pipeline_blocks_bad_model_retry_on_card_expired(session: AsyncSes
 
 
 async def test_prompt_text_persisted_for_reproducibility(session: AsyncSession):
-    """§5/§11: the decision stores the exact rendered context —
-    'reproducible' becomes literal, not just an inputs_hash."""
+    """Decision stores rendered context for reproducibility."""
     merchant = make_merchant_id()
     await seed_all(session)
 
@@ -321,14 +309,12 @@ async def test_prompt_text_persisted_for_reproducibility(session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
-# The due-scan — scheduled retries wait for the method
+# Due-scan
 # ---------------------------------------------------------------------------
 
 
 async def test_scheduled_hard_decline_retry_defers_then_unblocks(session: AsyncSession):
-    """Stripe's model, mechanically: the scheduled retry stays queued
-    (executes nothing) until PaymentMethodChanged lands — then the next
-    tick executes it through the same outbox."""
+    """Scheduled hard-decline retry defers until method changes, then fires once."""
     merchant = make_merchant_id()
     await seed_all(session)
 
@@ -349,13 +335,11 @@ async def test_scheduled_hard_decline_retry_defers_then_unblocks(session: AsyncS
 
     gateway = FakeGateway()
 
-    # T+2h: due, but no new method → deferred, gateway never called
     fired = await run_due_scheduled(session, gateway=gateway, now=now_utc() + timedelta(hours=2))
     await session.commit()
     assert fired == 0
     assert gateway.calls == []
 
-    # The customer updates their method
     await record_event(
         session,
         merchant_id=merchant,
@@ -367,12 +351,10 @@ async def test_scheduled_hard_decline_retry_defers_then_unblocks(session: AsyncS
     )
     await session.commit()
 
-    # T+4h: unblocked → executes
     fired = await run_due_scheduled(session, gateway=gateway, now=now_utc() + timedelta(hours=4))
     await session.commit()
     assert fired == 1
     assert len(gateway.calls) == 1
 
-    # And never re-fires
     again = await run_due_scheduled(session, gateway=gateway, now=now_utc() + timedelta(hours=5))
     assert again == 0

@@ -1,9 +1,4 @@
-"""HITL queue — no orphans, no phantom resolutions (§15).
-
-An escalation for an already-terminal entity is not a task — and a
-resolution that lands after the entity already recovered must close
-the task WITHOUT writing a second HumanResolved.
-"""
+"""HITL queue orphan and phantom-resolution guards."""
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,8 +27,6 @@ async def _failed_entity(session: AsyncSession, merchant, entity_id: str):
 
 
 async def test_enqueue_is_refused_for_recovered_entity(session: AsyncSession):
-    """RECOVERED has nothing to escalate — no orphan task, no future
-    SLA breach for work that doesn't exist."""
     merchant = make_merchant_id()
     await _failed_entity(session, merchant, "sub_done")
     await record_event(
@@ -70,9 +63,6 @@ async def test_enqueue_works_for_open_entity(session: AsyncSession):
 
 
 async def test_resolve_after_recovery_is_noop_without_phantom_event(session: AsyncSession):
-    """The race: task enqueued while open, entity recovers before the
-    human resolves. The task closes as an explicit no-op — no second
-    HumanResolved pollutes the ledger (and L3 never learns a lie)."""
     merchant = make_merchant_id()
     await _failed_entity(session, merchant, "sub_race")
 
@@ -83,7 +73,6 @@ async def test_resolve_after_recovery_is_noop_without_phantom_event(session: Asy
     await claim_task(session, task.id, assignee="ops-ada")
     await session.commit()
 
-    # Meanwhile the scheduled retry lands and recovers the entity
     await record_event(
         session, merchant_id=merchant, entity_id="sub_race",
         entity_type="subscription", event_type="RetrySucceeded",
@@ -107,13 +96,11 @@ async def test_resolve_after_recovery_is_noop_without_phantom_event(session: Asy
         )
     )
     types = [r[0] for r in events.all()]
-    assert types.count("HumanResolved") == 0  # no phantom resolution event
-    assert types.count("RetrySucceeded") == 1  # the real recovery stands alone
+    assert types.count("HumanResolved") == 0
+    assert types.count("RetrySucceeded") == 1
 
 
 async def test_normal_resolve_writes_back_to_ledger(session: AsyncSession):
-    """The happy path is untouched: open entity + human resolve →
-    HumanResolved lands in L0 for L3 to learn from."""
     merchant = make_merchant_id()
     await _failed_entity(session, merchant, "sub_fix")
 

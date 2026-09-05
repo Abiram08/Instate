@@ -1,25 +1,6 @@
-"""Instate replay — the counterfactual policy simulator (§9).
-
-Because L0 is immutable and L1 is derived, replaying decisions under a
-DIFFERENT policy comes nearly free — roughly the promised forty lines on
-top of event sourcing:
-
-    $ instate replay --policy v2 --set retry_ceiling_7d=2
-      vs v1:   recovered -₹X   compliance violations -Y   LLM calls -Z%
-
-Mechanics: build policy v_(n+1) as the current version with the given
-limits overridden, then re-evaluate every historical decision AT ITS
-ORIGINAL DECISION TIME (bi-temporal — `now=decision.created_at`) and
-diff the verdicts. Money impact is computed from what actually recovered
-per decision: if the new policy would have DENIED an action that in fact
-recovered money, that amount is projected-lost; DENYs that would have
-prevented a doomed attempt are projected-saved (nothing recovered on
-that decision anyway).
-
-It answers the question every collections team has and none can
-currently produce: "what does tightening the retry ceiling actually cost
-us in recovered revenue?"
-"""
+"""Counterfactual policy replay: re-decide history under overridden limits.
+Re-evaluates each decision at its original decision time
+(now=created_at, as_of=created_at) and diffs verdicts; read-only."""
 
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -63,11 +44,9 @@ async def replay_with_policy(
     overrides: dict[str, int],
     merchant_id: UUID | None = None,
 ) -> CounterfactualReport:
-    """Re-decide history under an overridden policy. Read-only: it
-    creates the shadow policy row(s) and reads — it never re-writes the
-    ledger or the real decisions."""
-    # Take the version in force for the entity types present (demo: one
-    # type; the override applies at every type the rule exists on)
+    """Re-decide history under an overridden policy.
+    Read-only: writes shadow policy rows, never rewrites ledger or decisions."""
+    # Latest version per entity type; overrides apply wherever the rule exists.
     q = select(Policy.entity_type, func.max(Policy.version)).group_by(Policy.entity_type)
     versions = dict((await session.execute(q)).all())
     if not versions:
@@ -112,15 +91,11 @@ async def replay_with_policy(
         if old_verdict == "ALLOW" and decision.executed_action is None:
             continue  # nothing was executed; the counterfactual is moot
 
-        # What would the counterfactual chain look like, at that moment?
-        new_chain: list[dict] = []
         state = await session.get(EntityState, (decision.merchant_id, decision.entity_id))
         entity_type = state.entity_type if state else "subscription"
         rules_cf = await get_rules(session, entity_type, to_version)
-        # NOTE: rules_at() below re-derives observed counts at the decision
-        # time using the stored rule shapes — the honest re-fold. BOTH the
-        # window anchor and the knowledge cutoff sit at created_at, so a
-        # late-recorded event cannot rewrite what was known then (§1b).
+        # Re-derive counts at decision time; window anchor and cutoff are created_at.
+        new_chain: list[dict] = []
         for rule in rules_cf:
             if rule.metric is None:
                 continue  # context rules can't be re-derived without context
@@ -152,7 +127,6 @@ async def replay_with_policy(
         report.verdict_changes += 1
         if old_verdict == "ALLOW":
             report.stricter += 1
-            # This action actually executed. Did it recover money?
             recovered = await _recovered_for_decision(session, decision.id)
             if recovered:
                 report.projected_recovered_lost_minor += recovered
@@ -177,7 +151,7 @@ async def replay_with_policy(
 
 
 async def _recovered_for_decision(session: AsyncSession, decision_id: int) -> int:
-    """Money this decision actually recovered (RetrySucceeded amounts)."""
+    """Sum of recovery amounts linked to a decision."""
     result = await session.execute(
         select(Event.payload).where(
             Event.decision_id == decision_id,

@@ -1,10 +1,4 @@
-"""Tests for the diagnosis map and action taxonomy (build item 5).
-
-The map and taxonomy are versioned DATA, not code — so the tests cover
-seeding idempotence, version isolation, and the never-empty guarantee:
-an unmapped code diagnoses as UNKNOWN, whose taxonomy row is a
-deterministic route to ESCALATE_HUMAN.
-"""
+"""Diagnosis map and action taxonomy seeding and lookup."""
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,9 +38,7 @@ async def test_seed_taxonomy_is_idempotent(session: AsyncSession):
     assert second == 0
 
 
-# ---------------------------------------------------------------------------
-# diagnose — the deterministic map
-# ---------------------------------------------------------------------------
+# diagnose
 
 
 @pytest.mark.parametrize(
@@ -62,7 +54,6 @@ async def test_seed_taxonomy_is_idempotent(session: AsyncSession):
     ],
 )
 async def test_diagnose_known_codes(session: AsyncSession, code, expected):
-    """Every seeded code resolves to its root cause — the map, not an LLM."""
     await seed_default_diagnosis(session)
     await session.commit()
 
@@ -70,7 +61,6 @@ async def test_diagnose_known_codes(session: AsyncSession, code, expected):
 
 
 async def test_diagnose_unknown_code_is_explicit(session: AsyncSession):
-    """An unmapped code is UNKNOWN — explicit, never silent."""
     await seed_default_diagnosis(session)
     await session.commit()
 
@@ -78,8 +68,6 @@ async def test_diagnose_unknown_code_is_explicit(session: AsyncSession):
 
 
 async def test_diagnose_missing_code_is_unknown(session: AsyncSession):
-    """A webhook with no code at all still has a branch — the never-empty
-    guarantee covers absence, not just novelty."""
     await seed_default_diagnosis(session)
     await session.commit()
 
@@ -87,13 +75,12 @@ async def test_diagnose_missing_code_is_unknown(session: AsyncSession):
 
 
 async def test_diagnosis_versions_do_not_bleed(session: AsyncSession):
-    """v2 can remap a code; v1 answers stay exactly what they were."""
     await seed_default_diagnosis(session, version=1)
     session.add(
         DiagnosisRule(
             version=2,
             failure_code="insufficient_funds",
-            root_cause="card_expired",  # a (silly) v2 reclassification
+            root_cause="card_expired",
             source="v2 test remap",
         )
     )
@@ -105,9 +92,7 @@ async def test_diagnosis_versions_do_not_bleed(session: AsyncSession):
     assert v2 == "card_expired"
 
 
-# ---------------------------------------------------------------------------
-# taxonomy — root cause → action
-# ---------------------------------------------------------------------------
+# taxonomy
 
 
 @pytest.mark.parametrize(
@@ -122,8 +107,6 @@ async def test_diagnosis_versions_do_not_bleed(session: AsyncSession):
     ],
 )
 async def test_taxonomy_rows(session: AsyncSession, root_cause, expected_action, deterministic):
-    """The §6 action taxonomy, keyed to decline reason — deterministic
-    routes (fraud, mandate, UNKNOWN) skip the model entirely."""
     await seed_default_taxonomy(session)
     await session.commit()
 
@@ -133,8 +116,6 @@ async def test_taxonomy_rows(session: AsyncSession, root_cause, expected_action,
 
 
 async def test_taxonomy_unknown_root_cause_hits_fallback(session: AsyncSession):
-    """Even a root cause with no taxonomy row resolves — to the UNKNOWN
-    fallback (deterministic escalate). The pipeline cannot dead-end."""
     await seed_default_taxonomy(session)
     await session.commit()
 
@@ -144,7 +125,6 @@ async def test_taxonomy_unknown_root_cause_hits_fallback(session: AsyncSession):
 
 
 async def test_customer_initiated_routes_to_link(session: AsyncSession):
-    """customer_initiated → contact, don't charge."""
     await seed_default_taxonomy(session)
     await session.commit()
 
@@ -154,7 +134,5 @@ async def test_customer_initiated_routes_to_link(session: AsyncSession):
 
 
 async def test_taxonomy_unseeded_raises(session: AsyncSession):
-    """No taxonomy and no UNKNOWN fallback is a hard error — an unseeded
-    system must never behave as an implicit allow-all."""
     with pytest.raises(LookupError):
         await taxonomy_for(session, "anything")

@@ -1,9 +1,4 @@
-"""Tests for L3 precedent — summaries, resolved-only, pre-filter, advisory.
-
-The rules under test (§4): embed case SUMMARIES never raw events; only
-resolved cases; pre-filter before ranking; return [] on any empty path —
-L3 is advisory, so empty is a normal answer, never an outage.
-"""
+"""L3 precedent tests: summaries only, resolved-only, pre-filtered, advisory."""
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,8 +42,7 @@ def test_case_situation_is_compact():
 
 
 async def test_seed_precedents_resolved_only(session: AsyncSession):
-    """Only RECOVERED entities become cases; open entities (at-ceiling)
-    have nothing to teach and produce none."""
+    """Only RECOVERED entities become cases."""
     merchant = make_merchant_id()
     await seed_history(session, merchant_id=merchant, entities=10, seed=42)
     await session.commit()
@@ -64,8 +58,7 @@ async def test_seed_precedents_resolved_only(session: AsyncSession):
 
 
 async def test_find_precedent_prefilters(session: AsyncSession):
-    """Pre-filter before ranking: a card_expired query never returns an
-    insufficient_funds case, no matter how similar the text is."""
+    """Pre-filter holds: card_expired query returns only card_expired cases."""
     merchant = make_merchant_id()
     await seed_history(session, merchant_id=merchant, entities=10, seed=42)
     await session.commit()
@@ -89,8 +82,7 @@ async def test_find_precedent_prefilters(session: AsyncSession):
 
 
 async def test_find_precedent_returns_one_liners(session: AsyncSession):
-    """The payload is a compact {situation → action → outcome} record —
-    token-efficient by construction, never a raw event dump."""
+    """Precedent payload is a compact situation→action→outcome record."""
     merchant = make_merchant_id()
     await seed_history(session, merchant_id=merchant, entities=10, seed=42)
     await session.commit()
@@ -130,8 +122,7 @@ async def test_find_precedent_ranks_by_similarity(session: AsyncSession):
 
 
 async def test_find_precedent_cold_store_returns_empty(session: AsyncSession):
-    """[] is a normal answer — the agent proceeds without precedent
-    (L3 down is a degradation, not an outage)."""
+    """Empty store returns []; L3 down is degradation, not outage."""
     merchant = make_merchant_id()
     results = await find_precedent(
         session,
@@ -181,7 +172,7 @@ async def test_merchant_isolation_in_precedent(session: AsyncSession):
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: the pipeline with and without precedent
+# End-to-end
 # ---------------------------------------------------------------------------
 
 
@@ -242,9 +233,7 @@ async def _failed_event(session: AsyncSession, merchant, entity_id: str):
 
 
 async def test_pipeline_completes_with_empty_l3(session: AsyncSession):
-    """L3 cold-start is a degradation, not an outage: with zero cases in
-    the store, the pipeline still calls the model, still executes, and
-    records precedent_ids=None — inspectable, not blamed."""
+    """Cold L3 still executes; precedent_ids stays None."""
     from instate.agent.decide import process_failure
     from instate.core.models import Decision
 
@@ -271,8 +260,7 @@ async def test_pipeline_completes_with_empty_l3(session: AsyncSession):
 
 
 async def test_pipeline_records_precedent_ids_when_l3_hits(session: AsyncSession):
-    """When precedent informs a decision, the case ids land on the
-    decision row — the advisory input is auditable."""
+    """Precedent hits land case ids on the decision row."""
     from instate.agent.decide import process_failure
     from instate.core.models import Decision
 

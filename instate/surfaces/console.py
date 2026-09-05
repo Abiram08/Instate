@@ -1,11 +1,4 @@
-"""Instate console — the read-only memory wall (§8d).
-
-supermemory's product moment, adapted to guarantees: "see what your
-agent remembers" — one merchant, every entity's state, the gates that
-fired, every decision with its reason chain. Server-rendered HTML, no
-JS build, an evening of work — and it is the moment a judge stops
-seeing a script and starts seeing a product.
-"""
+"""Read-only memory wall: server-rendered HTML, no JS, no POST routes."""
 
 from html import escape
 
@@ -115,8 +108,7 @@ def render_entity(
 
 
 def create_console_app(session_factory):
-    """Read-only FastAPI wrapper. No POST routes exist — a console that
-    cannot act is the point."""
+    """Read-only FastAPI wrapper (no POST routes)."""
     from fastapi import FastAPI, Response
 
     web = FastAPI(title="instate-console", docs_url=None, redoc_url=None)

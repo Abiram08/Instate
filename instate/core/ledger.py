@@ -1,15 +1,5 @@
-"""Instate L0 ledger — append-only event storage with per-entity hash chains.
-
-This is the truth tier (§1 of architecture.md). Every function here
-writes to or reads from the `events` table. Nothing ever updates or
-deletes an event.
-
-Key invariants:
-- record_event() is idempotent by source_event_id (webhook redelivery is inert)
-- The hash chain is per-entity: prev_hash = hash of the previous event
-  for the SAME (merchant_id, entity_id), not a global chain
-- payload_hash is computed from the serialized payload; it survives
-  payload redaction (payload → NULL) without breaking the chain
+"""Append-only L0 event ledger with per-entity hash chains (§1).
+Idempotent by source_event_id; payload_hash survives payload redaction.
 """
 
 import hashlib
@@ -30,10 +20,8 @@ from instate.core.models import ArchiveAnchor, Event
 
 
 def compute_payload_hash(payload: dict[str, Any] | None) -> bytes:
-    """Hash the payload deterministically (sorted keys → stable output).
-
-    Returns a fixed 32-byte digest even for None, so the chain
-    still verifies after payload redaction (payload → NULL).
+    """Deterministic payload hash (sorted keys).
+    None hashes as b"null" so the chain verifies after redaction.
     """
     if payload is None:
         return hashlib.sha256(b"null").digest()
@@ -49,12 +37,9 @@ def compute_event_hash(
     occurred_at: datetime,
     payload_hash: bytes,
 ) -> bytes:
-    """Compute the per-entity chain hash.
+    """Per-entity chain hash over prev_hash, merchant, entity, type, time, payload_hash.
 
-    hash = sha256(prev_hash || merchant_id || entity_id || event_type
-                  || occurred_at || payload_hash)
-
-    prev_hash is None for the first event of an entity (genesis).
+    None prev_hash = genesis event.
     """
     h = hashlib.sha256()
     h.update(prev_hash if prev_hash else b"")
@@ -74,11 +59,7 @@ def compute_event_hash(
 
 
 class DuplicateEventError(Exception):
-    """Raised when a source_event_id already exists (webhook redelivery).
-
-    The caller treats this as a no-op (inert), not an error condition
-    worth alarming on — Razorpay retries delivery as a matter of course.
-    """
+    """source_event_id already exists; caller treats as inert no-op."""
 
     def __init__(self, source_event_id: str):
         self.source_event_id = source_event_id
@@ -96,20 +77,13 @@ async def record_event(
     payload: dict[str, Any] | None = None,
     source_event_id: str | None = None,
     decision_id: int | None = None,
+    channel: str | None = None,
 ) -> Event:
-    """Append an event to L0. Idempotent by source_event_id.
+    """Append one event to L0; idempotent by source_event_id.
 
-    This is the single entry point for all writes to the events table.
-    It:
-    1. Checks dedupe (source_event_id UNIQUE constraint)
-    2. Fetches the entity's last hash (per-entity chain)
-    3. Computes payload_hash and event hash
-    4. INSERTs (append-only)
-
-    Returns the persisted Event. Raises DuplicateEventError if
-    source_event_id already exists — treat as a no-op.
+    Raises DuplicateEventError on redelivery. `channel` defaults to
+    payload["channel"] so per-channel caps stay indexed.
     """
-    # 1. Dedupe check (application-level; the UNIQUE constraint is the backstop)
     if source_event_id is not None:
         existing = await session.execute(
             select(Event.id).where(Event.source_event_id == source_event_id)
@@ -117,7 +91,6 @@ async def record_event(
         if existing.scalar_one_or_none() is not None:
             raise DuplicateEventError(source_event_id)
 
-    # 2. Fetch the entity's previous hash (per-entity chain, NOT global)
     last_hash_result = await session.execute(
         select(Event.hash)
         .where(Event.merchant_id == merchant_id, Event.entity_id == entity_id)
@@ -126,13 +99,14 @@ async def record_event(
     )
     prev_hash = last_hash_result.scalar_one_or_none()
 
-    # 3. Compute hashes
     p_hash = compute_payload_hash(payload)
     e_hash = compute_event_hash(
         prev_hash, merchant_id, entity_id, event_type, occurred_at, p_hash
     )
 
-    # 4. Append (INSERT only — no UPDATE, no DELETE, ever)
+    if channel is None and isinstance(payload, dict):
+        candidate = payload.get("channel")
+        channel = candidate if isinstance(candidate, str) else None
     event = Event(
         merchant_id=merchant_id,
         entity_id=entity_id,
@@ -143,6 +117,7 @@ async def record_event(
         payload_hash=p_hash,
         source_event_id=source_event_id,
         decision_id=decision_id,
+        channel=channel,
         prev_hash=prev_hash,
         hash=e_hash,
     )
@@ -164,19 +139,24 @@ async def get_timeline(
     *,
     limit: int = 50,
     offset: int = 0,
+    as_of: datetime | None = None,
 ) -> list[Event]:
-    """Ordered event history for an entity (oldest first).
+    """Entity history oldest-first; default limit bounds full-table reads (§8).
 
-    `limit` has a sane default so a naive caller cannot dump the
-    entire event log into their context window (poka-yoke, §8).
+    `as_of` pins a snapshot: only events recorded at or before it are
+    visible. Reads default to the latest view (causal hot path); pass `as_of`
+    for a point-in-time read — "what was true when this was decided".
     """
-    result = await session.execute(
+    query = (
         select(Event)
         .where(Event.merchant_id == merchant_id, Event.entity_id == entity_id)
         .order_by(Event.occurred_at.asc(), Event.id.asc())
         .offset(offset)
         .limit(limit)
     )
+    if as_of is not None:
+        query = query.where(Event.recorded_at <= as_of)
+    result = await session.execute(query)
     return list(result.scalars().all())
 
 
@@ -196,7 +176,7 @@ async def get_event_by_source_id(
 
 
 class ChainVerificationResult:
-    """Result of walking an entity's hash chain."""
+    """Verified flag + event count + break reason for one entity."""
 
     def __init__(
         self,
@@ -229,28 +209,10 @@ async def verify_chain(
     merchant_id: UUID,
     entity_id: str,
 ) -> ChainVerificationResult:
-    """Walk an entity's hash chain and verify integrity.
+    """Verify an entity's chain in insertion (id) order, not occurred_at (§1b).
 
-    The chain is built in INSERTION order (that's what prev_hash links),
-    so verification walks by event id — NOT by occurred_at. A late or
-    out-of-order webhook appends at the chain's tail even though its
-    valid-time (occurred_at) is older; bi-temporal reads sort by
-    occurred_at, chain verification sorts by id. Conflating the two is
-    exactly how a tamper-evidence check produces false breaks.
-
-    For each event (in insertion order):
-    - prev_hash must equal the previous event's hash (None for genesis)
-    - hash must equal sha256(prev_hash || merchant || entity || type || time || payload_hash)
-
-    After cold archival the hot chain no longer starts at genesis: its
-    first event's prev_hash points at an archived event. That link is
-    accepted IFF the latest ArchiveAnchor for the entity vouches for
-    exactly it (anchor_hash == prev_hash and the anchor covers an older
-    event id) — cold rows + anchor + hot rows verify as one chain. A
-    cut with no (or a tampered) anchor fails honestly.
-
-    Returns a ChainVerificationResult with verified=True if the chain
-    is intact (zero breaks), or verified=False with the specific error.
+    A cut starting mid-history verifies only if the latest ArchiveAnchor
+    vouches for exactly it (anchor_hash == prev_hash, older event id).
     """
     result = await session.execute(
         select(Event)
@@ -266,7 +228,6 @@ async def verify_chain(
     prev_hash: bytes | None = None
     archived_prefix = False
     for i, event in enumerate(events):
-        # Check the link
         if event.prev_hash != prev_hash:
             if i == 0 and event.prev_hash is not None and await _anchor_vouches(
                 session, merchant_id, entity_id, event
@@ -282,7 +243,6 @@ async def verify_chain(
                     f"got {event.prev_hash.hex()[:16] if event.prev_hash else 'None'}",
                 )
 
-        # Recompute the hash
         expected = compute_event_hash(
             event.prev_hash,
             event.merchant_id,
@@ -313,14 +273,7 @@ async def _anchor_vouches(
     entity_id: str,
     first_hot_event: Event,
 ) -> bool:
-    """Does the latest archive anchor vouch for this exact cut link?
-
-    True iff an anchor exists with anchor_hash == the hot event's
-    prev_hash AND the anchor covers a strictly older event id — i.e.
-    the cold prefix this hot chain continues from is exactly the one
-    that was archived. Anything else (no anchor, tampered anchor,
-    anchor for a different cut) is a break, reported honestly.
-    """
+    """True iff the latest anchor vouches for this exact cut link."""
     result = await session.execute(
         select(ArchiveAnchor)
         .where(
@@ -347,15 +300,9 @@ async def redact_payload(
     session: AsyncSession,
     event_id: int,
 ) -> bool:
-    """Null the payload of an event (data-retention / PII redaction).
+    """Null an event payload; payload_hash stays so the chain verifies (§1c).
 
-    The payload_hash stays, so the chain still verifies: you can prove
-    a record was not altered AFTER deleting its contents (§1c).
-
-    NOTE: this is the ONE sanctioned UPDATE to the events table,
-    and it only nulls payload — nothing else. In production, this
-    would be a DB-level trigger or a separate retention job, but
-    the mechanism is the same: payload → NULL, payload_hash stays.
+    The one sanctioned UPDATE to events, and only the payload column.
     """
     from sqlalchemy import update
 

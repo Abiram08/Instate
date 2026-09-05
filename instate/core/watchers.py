@@ -1,24 +1,9 @@
-"""Instate watchers — memory that initiates (§2, the Context.dev monitor pattern).
-
-A memory layer that only answers questions is half a product: agents that
-act over time also need to be TOLD when something changes. A watcher is a
-condition over L1/L2 facts — integers and timestamps, never embeddings
-(the same trust rule as the gates) — that pushes a SIGNED webhook when it
-trips. The agent doesn't poll Instate; Instate calls the agent.
-
-Built-in conditions (all computable from L1 + indexed L0 counts):
-  - retry_count_7d >= threshold   (warn BEFORE the ceiling — the same
-    indexed count the gates use)
-  - open_ptp_due                  (promise-to-pay overdue)
-  - stale_awaiting >= N days      (AWAITING_PROMISE with no activity)
-
-Cooldown prevents re-fire spam; the tick loop owns the checks.
-"""
+"""Watchers: conditions over L1/L2 facts pushing signed webhooks (§2). Integers/timestamps only, never embeddings."""
 
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
@@ -40,8 +25,7 @@ class Notifier(Protocol):
 
 
 class HTTPXNotifier:
-    """Signed webhook delivery — the signature lets the receiver prove the
-    push came from Instate, the same trust direction as webhook intake."""
+    """Signed webhook delivery."""
 
     def __init__(self, timeout_seconds: float = 10.0):
         self._timeout = timeout_seconds
@@ -82,6 +66,19 @@ def _condition_met(
 
     if metric == "retry_count_7d":
         value = retry_count_7d
+    elif metric == "card_expiring_within_days":
+        # Needs CardExpiring on file; never guess missing expiry.
+        if state is None or state.card_exp_year is None or state.card_exp_month is None:
+            return False
+        import calendar
+
+        today = now.date()
+        last_day = calendar.monthrange(state.card_exp_year, state.card_exp_month)[1]
+        expiry = date(state.card_exp_year, state.card_exp_month, last_day)
+        value = (expiry - today).days
+        # Expired cards are owned by the diagnose path.
+        if value < 0:
+            return False
     elif metric == "open_ptp_due":
         if state is None or state.open_ptp_due_at is None:
             return False
@@ -100,6 +97,10 @@ def _condition_met(
         return value >= threshold
     if op == ">":
         return value > threshold
+    if op == "<=":
+        return value <= threshold
+    if op == "<":
+        return value < threshold
     if op == "==":
         return value == threshold
     return False
@@ -111,12 +112,7 @@ async def check_watchers(
     notifier: Notifier,
     now: datetime | None = None,
 ) -> int:
-    """Tick-loop half: evaluate every active watcher, fire with cooldown.
-
-    Returns how many webhooks were pushed. A watcher that trips for an
-    entity fires once per cooldown window — memory that initiates should
-    nudge, not spam.
-    """
+    """Evaluate active watchers; fire with cooldown. Returns webhooks pushed."""
     now = now or datetime.now(UTC)
     watchers = await session.execute(
         select(Watcher).where(Watcher.active.is_(True)).order_by(Watcher.id.asc())
@@ -124,13 +120,12 @@ async def check_watchers(
     fired = 0
 
     for watcher in watchers.scalars():
-        # Cooldown
         if watcher.last_fired_at and now - watcher.last_fired_at < timedelta(
             seconds=watcher.cooldown_seconds
         ):
             continue
 
-        # Candidate entities: scoped by type (+ optional entity_id pin)
+        # Candidate entities scoped by type (+ optional entity_id pin)
         q = select(EntityState).where(
             EntityState.merchant_id == watcher.merchant_id,
             EntityState.entity_type == watcher.entity_type,
@@ -186,11 +181,12 @@ async def seed_default_watchers(
     secret: str = "watcher-secret",
     entity_type: str = "subscription",
 ) -> int:
-    """The three demo watchers (idempotent per URL+condition)."""
+    """Seed watchers (idempotent per URL+condition)."""
     defaults = [
         {"metric": "retry_count_7d", "op": ">=", "threshold": 2},
         {"metric": "open_ptp_due", "op": "<", "threshold": 0},
         {"metric": "stale_awaiting", "op": ">=", "threshold": 3},
+        {"metric": "card_expiring_within_days", "op": "<=", "threshold": 30},
     ]
     existing_rows = await session.execute(
         select(Watcher).where(

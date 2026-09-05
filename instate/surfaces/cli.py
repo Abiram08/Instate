@@ -1,20 +1,21 @@
-"""instate CLI — the audit trail you can hold (§8c).
-
-The demo surface is deliberately a CLI, not a web app: a terminal that
-makes the memory tangible live — `instate timeline` shows the audit
-trail, `instate verify` proves it's tamper-evident, `instate explain`
-opens one decision's reason chains. This is where "explainable, bounded,
-gated" stops being a slide and becomes something the audience can read.
-
-Built on typer + rich: panels, tables, color-coded event classes. The
-event colors ARE the correctness classes — deterministic events green,
-money blue, failures red, escalations yellow, contacts cyan.
+"""instate CLI — timeline, verify, explain, rebuild, replay, demo over the ledger.
+Built on typer + rich. Event colors map to classes: failures red, money
+green/blue, escalations yellow, contacts cyan.
 """
 
 import asyncio
 import json
+import sys
 from datetime import datetime
 from uuid import UUID
+
+# Windows consoles default to cp1252; force UTF-8 so tables render ₹/✓.
+if sys.platform == "win32":  # pragma: no cover - platform-specific
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 import typer
 from rich import box
@@ -39,7 +40,7 @@ console = Console()
 @app.callback(invoke_without_command=True)
 def _root(ctx: typer.Context):
     if ctx.invoked_subcommand is None:
-        # Show Meniscus-grade banner + help when run bare — like `men` with no args
+        # Show banner + help when run bare.
         from pathlib import Path
 
         try:
@@ -59,37 +60,29 @@ def _root(ctx: typer.Context):
         raise typer.Exit(0)
 
 # ---------------------------------------------------------------------------
-# Event classes → colors (the correctness classes, made visible)
+# Event type → display color
 # ---------------------------------------------------------------------------
 
 EVENT_STYLES: dict[str, str] = {
-    # failures — red
     "PaymentFailed": "bold red",
     "FailureDiagnosed": "red",
     "ActionFailed": "bold red",
     "RecoveryReversed": "red",
     "InvoiceOverdue": "red",
     "CheckoutAbandoned": "red",
-    # money — green
     "RetrySucceeded": "bold green",
     "PromiseHonored": "green",
     "HumanResolved": "green",
     "PaymentRecovered": "bold green",
-    # money attempts — blue
     "RetryAttempted": "blue",
     "RetryScheduled": "blue",
-    # contacts — cyan
     "CustomerContacted": "cyan",
     "PaymentLinkSent": "cyan",
     "RecoveryActionSent": "cyan",
-    # escalation — yellow
     "EscalatedToHuman": "yellow",
-    # method — magenta
     "PaymentMethodChanged": "magenta",
-    # promises — bright green
     "PromiseMade": "bright_green",
     "PromiseBroken": "yellow",
-    # plumbing — dim
     "ActionIntended": "dim",
     "ActionCompleted": "dim green",
 }
@@ -156,11 +149,16 @@ async def _default_merchant(session) -> UUID | None:
 
 
 async def _seed_knowledge(session) -> None:
-    """Seed policy + diagnosis + taxonomy (idempotent)."""
+    """Seed policy + diagnosis + taxonomy (idempotent).
+
+    Policy is per entity_type — webhooks land as `payment` entities while
+    generated history is `subscription`, so both types get the defaults.
+    """
     from instate.agent.diagnose import seed_default_diagnosis, seed_default_taxonomy
     from instate.core.policy import seed_default_policy
 
     await seed_default_policy(session)
+    await seed_default_policy(session, entity_type="payment")
     await seed_default_diagnosis(session)
     await seed_default_taxonomy(session)
     await session.commit()
@@ -219,16 +217,24 @@ def timeline(
     entity_id: str = typer.Argument(..., help="The entity to inspect."),
     merchant: str = typer.Option(None, help="Merchant UUID (first found when omitted)."),
     limit: int = typer.Option(50, min=1, max=500, help="Max events shown (poka-yoke)."),
+    as_of: str = typer.Option(
+        None, "--as-of", help="Pinned snapshot: only events recorded at/before this ISO time."
+    ),
 ):
     """The full audit trail for one entity — every event, hash-chained."""
-    asyncio.run(_timeline_cmd(entity_id, merchant, limit))
+    asyncio.run(_timeline_cmd(entity_id, merchant, limit, as_of))
 
 
-async def _timeline_cmd(entity_id: str, merchant: str | None, limit: int):
-    from instate.core.ledger import get_timeline, verify_chain
-    from instate.core.models import EntityState
-    from instate.core.projection import get_windowed_count
-    from datetime import timedelta
+async def _timeline_cmd(entity_id: str, merchant: str | None, limit: int, as_of: str | None):
+    from instate.core.ledger import get_timeline
+
+    pinned = None
+    if as_of:
+        try:
+            pinned = datetime.fromisoformat(as_of)
+        except ValueError:
+            console.print(f"[red]bad --as-of {as_of!r} — use ISO, e.g. 2026-09-05T12:00:00+00:00[/red]")
+            raise typer.Exit(1)
 
     factory = await _open_session()
     async with factory() as session:
@@ -237,64 +243,24 @@ async def _timeline_cmd(entity_id: str, merchant: str | None, limit: int):
             console.print("[red]no data — run `instate seed` first[/red]")
             return
 
-        events = await get_timeline(session, mid, entity_id, limit=limit)
-        state = await session.get(EntityState, (mid, entity_id))
-        verification = await verify_chain(session, mid, entity_id)
-        retry_7d = await get_windowed_count(
-            session, mid, entity_id, "retry_count_7d", timedelta(days=7)
-        )
-        contacts_24h = await get_windowed_count(
-            session, mid, entity_id, "contacts_24h", timedelta(hours=24)
-        )
+        events = await get_timeline(session, mid, entity_id, limit=limit, as_of=pinned)
 
-    table = Table(
-        title=f"timeline · {entity_id}",
-        box=box.ROUNDED,
-        title_style="bold",
-        expand=True,
-    )
-    table.add_column("#", style="dim", width=6, justify="right")
-    table.add_column("when (occurred)", style="dim", width=16)
-    table.add_column("event", width=20)
-    table.add_column("detail", ratio=1)
-    table.add_column("decision", justify="right", width=9, style="dim")
-
-    for i, event in enumerate(events, start=1):
-        style = EVENT_STYLES.get(event.event_type, "white")
-        table.add_row(
-            str(i),
-            fmt_when(event.occurred_at),
-            Text(event.event_type, style=style),
-            describe_event(event),
-            f"d{event.decision_id}" if event.decision_id else "",
-        )
-
-    console.print(table)
-
-    state_bits = []
-    if state:
-        state_bits.append(
-            ("status", Text(state.status, style=STATUS_STYLES.get(state.status, "white")))
-        )
-        if state.amount_at_risk_minor:
-            state_bits.append(("at risk", f"₹{state.amount_at_risk_minor / 100:,.0f}"))
-        if state.last_failure_reason:
-            state_bits.append(("last failure", state.last_failure_reason))
-        if state.open_ptp_due_at:
-            state_bits.append(("promise due", fmt_when(state.open_ptp_due_at)))
-    state_bits.append(("retries · 7d", str(retry_7d)))
-    state_bits.append(("contacts · 24h", str(contacts_24h)))
-
-    kv = "   ".join(f"[dim]{k}[/dim] {v}" for k, v in state_bits)
-    console.print(Panel(kv, title="entity state (L1 + indexed counters)", box=box.SIMPLE))
-
-    if verification.verified:
-        console.print(
-            f"  [green]✓[/green] chain verified — {verification.event_count} events, "
-            f"zero breaks. This trail is tamper-evident."
-        )
-    else:
-        console.print(f"  [bold red]✗ CHAIN BROKEN:[/bold red] {verification.error}")
+    scope = f"— as of {as_of}" if as_of else "— timeline"
+    console.print(f"\n[bold]{entity_id}[/bold] [dim]{scope}[/dim]\n")
+    for event in events:
+        when = event.occurred_at.strftime("%b %d")
+        color = {
+            "PaymentFailed": "red",
+            "RetryAttempted": "blue",
+            "RetrySucceeded": "green",
+            "PromiseMade": "cyan",
+            "PromiseHonored": "green",
+            "EscalatedToHuman": "yellow",
+            "PaymentLinkSent": "cyan",
+            "CustomerContacted": "cyan",
+        }.get(event.event_type, "white")
+        detail = describe_event(event)
+        console.print(f"  [dim]{when}[/dim]  [{color}]{event.event_type:<18}[/{color}] {detail}")
 
 
 async def _pick_merchant(session, merchant: str | None) -> UUID | None:
@@ -313,7 +279,7 @@ def verify(
     entity_id: str = typer.Argument(None, help="One entity, or all when omitted."),
     merchant: str = typer.Option(None),
 ):
-    """Verify hash chains — 'audit trail' as a proof, not a claim."""
+    """Verify hash chains for one entity or all."""
     asyncio.run(_verify_cmd(entity_id, merchant))
 
 
@@ -329,14 +295,20 @@ async def _verify_cmd(entity_id: str | None, merchant: str | None):
             console.print("[red]no data — run `instate seed` first[/red]")
             return
         if entity_id:
-            targets = [(mid, entity_id)]
-        else:
-            rows = await session.execute(
-                select(Event.merchant_id, Event.entity_id)
-                .where(Event.merchant_id == mid)
-                .group_by(Event.merchant_id, Event.entity_id)
-            )
-            targets = [(r.merchant_id, r.entity_id) for r in rows.all()]
+            result = await verify_chain(session, mid, entity_id)
+            console.print(f"verifying chain for {entity_id} ... "
+                          f"{result.event_count} events, {result.event_count} hashes checked")
+            if result.verified:
+                console.print("[green]✓ intact — no breaks[/green]")
+            else:
+                console.print(f"[bold red]✗ BROKEN: {result.error}[/bold red]")
+            return
+        rows = await session.execute(
+            select(Event.merchant_id, Event.entity_id)
+            .where(Event.merchant_id == mid)
+            .group_by(Event.merchant_id, Event.entity_id)
+        )
+        targets = [(r.merchant_id, r.entity_id) for r in rows.all()]
 
         results = [await verify_chain(session, m, e) for m, e in targets]
 
@@ -388,56 +360,41 @@ async def _explain_cmd(decision_id: int):
         console.print(f"[red]decision {decision_id} not found[/red]")
         raise typer.Exit(1)
 
-    header = (
-        f"[bold]decision #{decision.id}[/bold]   entity [cyan]{decision.entity_id}[/cyan]"
-        f"   cause [red]{decision.root_cause}[/red]   policy v{decision.policy_version}"
-    )
-    if decision.executed_action:
-        header += f"   executed [bold]{decision.executed_action}[/bold]"
-    if decision.model:
-        header += f"\n[dim]model {decision.model} · in {decision.tokens_in} tok · out {decision.tokens_out} tok[/dim]"
-    console.print(Panel(header, box=box.ROUNDED))
-
-    def chain_table(name: str, chain: list | None) -> Table:
-        t = Table(title=name, box=box.SIMPLE, expand=True)
-        t.add_column("rule", style="bold")
-        t.add_column("metric", style="dim")
-        t.add_column("observed / limit", justify="center")
-        t.add_column("verdict", justify="center")
-        t.add_column("detail", style="dim")
+    def one_line(chain: list | None) -> str:
+        bits = []
         for entry in chain or []:
-            obs = entry.get("observed")
-            lim = entry.get("limit")
-            ratio = f"{obs} / {lim}" if obs is not None and lim is not None else "—"
-            verdict = entry.get("verdict", "?")
-            style = {"DENY": "bold red", "REQUIRE_HUMAN": "yellow", "ALLOW": "green"}.get(
-                verdict, "white"
-            )
-            t.add_row(
-                entry.get("rule_id", "?"),
-                entry.get("metric") or "context",
-                ratio,
-                Text(verdict, style=style),
-                entry.get("detail") or "",
-            )
-        return t
+            obs, lim = entry.get("observed"), entry.get("limit")
+            ratio = f"{obs}/{lim}" if obs is not None and lim is not None else ""
+            bits.append(f"{entry.get('rule_id', '?')}{': ' + ratio if ratio else ''} → {entry.get('verdict', '?')}")
+        return "; ".join(bits) or "—"
 
-    console.print(chain_table("gate-1 · class-level verdicts", decision.gate1))
-    console.print(chain_table("gate-2 · concrete-proposal verdicts", decision.gate2))
+    proposal = decision.proposal or {}
+    conf = proposal.get("confidence")
+    conf_s = f" · confidence {conf:.2f}" if isinstance(conf, (int, float)) else ""
+    inputs = (decision.inputs_hash or b"").hex()[:4] + "…" + (decision.inputs_hash or b"").hex()[-4:] if decision.inputs_hash else "—"
 
-    if decision.proposal:
-        proposal = json.dumps(decision.proposal, indent=2, default=str)
-        console.print(Panel(proposal, title="the model's proposal", box=box.SIMPLE))
+    console.print(f"\n[bold]decision {decision.id}[/bold] [dim]— {decision.entity_id}[/dim]\n")
+    console.print(f"  [dim]root cause[/dim]      {decision.root_cause}")
+    console.print(f"  [dim]gate-1[/dim]          {one_line(decision.gate1)}")
+    console.print(
+        f"  [dim]model proposal[/dim]  {proposal.get('action', '—')} · "
+        f"{proposal.get('timing', '—')}{conf_s}"
+    )
+    console.print(f"  [dim]gate-2[/dim]          {one_line(decision.gate2)}")
+    console.print(f"  [dim]executed[/dim]        {decision.executed_action or '—'}")
+    console.print(
+        f"  [dim]inputs_hash[/dim]     {inputs}   (reproducible — same inputs, same output)"
+    )
 
 
 # ---------------------------------------------------------------------------
-# instate rebuild — the honesty proof
+# instate rebuild
 # ---------------------------------------------------------------------------
 
 
 @app.command()
 def rebuild():
-    """Drop L1, replay L0, diff — ten-second proof the projection is honest."""
+    """Drop L1, replay L0, diff for drift."""
     asyncio.run(_rebuild_cmd())
 
 
@@ -543,25 +500,74 @@ async def _replay_cmd(overrides: dict[str, int], merchant: str | None):
 @app.command()
 def demo(
     entities: int = typer.Option(10, help="History entities for both runs."),
+    ab: bool = typer.Option(
+        False, "--ab", help="Run the A/B link-wording experiment instead (variants A vs B)."
+    ),
+    live: bool = typer.Option(
+        False, "--live", help="Use real Razorpay test-mode keys (RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET). Default is the reproducible stand-in gateway."
+    ),
+    pace: float = typer.Option(
+        0.45, "--pace", help="Seconds between pipeline stage reveals. 0 disables animation (CI)."
+    ),
 ):
     """Run the identical batch through the stateless baseline and the
     Instate-backed agent; print the measured comparison."""
-    asyncio.run(_demo_cmd(entities))
+    asyncio.run(_demo_ab_cmd(entities) if ab else _demo_cmd(entities, live=live, pace=pace))
 
 
-async def _demo_cmd(entities: int):
-    from instate.replay.compare import run_comparison
+async def _demo_ab_cmd(entities: int):
+    from instate.replay.compare import run_ab_test
 
-    with console.status("running the identical batch through both agents…"):
-        result = await run_comparison(entities=entities)
+    with console.status("running link wording A vs B on identical batches…"):
+        result = await run_ab_test(entities=entities)
+
+    console.print(
+        Panel(
+            "[bold]Same batch, two wordings. Only the link copy differs.[/bold]\n"
+            "[dim]Identical seeds, identical gates — conversion delta is the wording.[/dim]",
+            box=box.ROUNDED,
+        )
+    )
+    console.print(result["table"])
+
+
+async def _demo_cmd(entities: int, live: bool = False, pace: float = 0.45):
+    from instate.surfaces.live_demo import final_table, run_live_demo
+
+    import os
+
+    gateway_factory = None
+    if live:
+        if not (os.environ.get("RAZORPAY_KEY_ID") and os.environ.get("RAZORPAY_KEY_SECRET")):
+            console.print(
+                "[red]--live needs RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in env.[/red] "
+                "Falling back to stand-in gateway."
+            )
+            mode_note = "reproducible stand-in model + gateway"
+        else:
+            from instate.adapters.razorpay import RazorpayGateway
+
+            key_id = os.environ["RAZORPAY_KEY_ID"]
+            key_secret = os.environ["RAZORPAY_KEY_SECRET"]
+            gateway_factory = lambda: RazorpayGateway(key_id=key_id, key_secret=key_secret)  # noqa: E731
+            mode_note = "LIVE Razorpay test-mode gateway on both arms (same gateway, fair)"
+    else:
+        mode_note = "reproducible stand-in model + gateway"
 
     console.print(
         Panel(
             "[bold]One batch. Two agents. The only difference is the memory layer.[/bold]\n"
-            "[dim]Same seed, same scripted model, same realistic gateway — fair by construction.[/dim]",
+            f"[dim]Same seed, fair by construction. Mode: {mode_note}.[/dim]",
             box=box.ROUNDED,
         )
     )
+    result = await run_live_demo(
+        entities=entities, pace=pace, console=console, gateway_factory=gateway_factory
+    )
+
+    console.print()
+    base_esc, inst_esc = result.get("escalated", (0, 0))
+    console.print(final_table(result["baseline"], result["instate"], base_esc, inst_esc))
     console.print(result["table"])
     instate = result["instate"]
     console.print(
@@ -612,7 +618,7 @@ async def _demo_cmd(entities: int):
 
 
 # ---------------------------------------------------------------------------
-# instate watch — memory that initiates
+# instate watch
 # ---------------------------------------------------------------------------
 
 watch_app = typer.Typer(
@@ -623,7 +629,6 @@ app.add_typer(watch_app, name="watch")
 
 @watch_app.command("list")
 def watch_list():
-    """Every registered watcher."""
     asyncio.run(_watch_list_cmd())
 
 
@@ -685,7 +690,7 @@ async def _watch_add_cmd(metric: str, threshold: float, target_url: str, merchan
 
 @watch_app.command("run")
 def watch_run():
-    """Check every watcher once, now (the tick-loop half, on demand)."""
+    """Check every watcher once, now."""
     asyncio.run(_watch_run_cmd())
 
 
@@ -703,8 +708,90 @@ async def _watch_run_cmd():
     )
 
 
+worker_app = typer.Typer(help="Run the worker loop.", no_args_is_help=True)
+app.add_typer(worker_app, name="worker")
+
+
+@worker_app.command("tick")
+def worker_tick(
+    scripted: bool = typer.Option(
+        True, "--scripted/--llm", help="Scripted model (reproducible) vs Gemini (GEMINI_API_KEY)."
+    ),
+):
+    """One worker step: diagnose → gate → reason → execute over pending failures."""
+    asyncio.run(_worker_tick_cmd(scripted))
+
+
+async def _worker_tick_cmd(scripted: bool):
+    import os
+
+    from instate.adapters.failover import FailoverReasoner
+    from instate.agent.decide import drain_pending
+    from instate.agent.execute import run_due_scheduled
+    from instate.replay.compare import RealisticGateway, SharedScriptedReasoner
+
+    if scripted or not os.environ.get("GEMINI_API_KEY"):
+        reasoner = SharedScriptedReasoner()
+        model_note = "scripted model (reproducible)"
+    else:
+        from instate.adapters.llm import GeminiReasoner
+
+        reasoner = FailoverReasoner(GeminiReasoner(api_key=os.environ["GEMINI_API_KEY"]))
+        model_note = "Gemini (failover → policy default)"
+
+    factory = await _open_session()
+    async with factory() as session:
+        await _seed_knowledge(session)  # idempotent; covers payment entities too
+        mid = await _pick_merchant(session, None)
+        if mid is None:
+            console.print("[red]no data — run `instate seed` first[/red]")
+            return
+        gw = RealisticGateway()
+        results = await drain_pending(session, reasoner=reasoner, gateway=gw)
+        await run_due_scheduled(session, gateway=gw)
+        await session.commit()
+
+    decided = sum(1 for r in results if r.decision_id is not None)
+    console.print(
+        f"[green]✓ tick complete[/green] — {decided}/{len(results)} failures decided "
+        f"[dim]({model_note})[/dim]"
+        if results
+        else "[dim]tick complete — nothing pending.[/dim]"
+    )
+
+
+@worker_app.command("resume")
+def worker_resume(
+    pace: float = typer.Option(0.45, "--pace", help="Seconds between reconcile lines. 0 disables."),
+):
+    """Boot reconciliation: resolve dangling ActionIntended rows by idempotency key."""
+    asyncio.run(_worker_resume_cmd(pace))
+
+
+async def _worker_resume_cmd(pace: float):
+    import os
+
+    from instate.adapters.razorpay import RazorpayGateway
+    from instate.surfaces.live_demo import run_resume
+
+    factory = await _open_session()
+    async with factory() as session:
+        gateway = RazorpayGateway(
+            key_id=os.environ.get("RAZORPAY_KEY_ID", ""),
+            key_secret=os.environ.get("RAZORPAY_KEY_SECRET", ""),
+        )
+        details = await run_resume(session, gateway=gateway, pace=pace, console=console)
+
+    recovered = sum(1 for d in details if d.status == "completed")
+    console.print(
+        f"\n  [green]✓ reconciled {recovered}/{len(details)}[/green]"
+        if details
+        else "  [dim]nothing dangling — ledger and gateway agree.[/dim]"
+    )
+
+
 # ---------------------------------------------------------------------------
-# instate init — Meniscus-grade wizard (Step 1..4, provider picker)
+# instate init
 # ---------------------------------------------------------------------------
 
 
@@ -712,7 +799,7 @@ async def _watch_run_cmd():
 def init(
     memory_home: str = typer.Option(None, help="Memory home path (default ~/.instate)"),
 ):
-    """Interactive setup — like `men init`: banner, memory home, LLM provider picker."""
+    """Interactive setup: memory home and LLM provider."""
     from pathlib import Path
 
     from instate.surfaces.wizard import run_wizard
@@ -749,42 +836,31 @@ async def _prod_cmd():
     from instate.core.tenant import rls_ddl
 
     checks = []
-    # 1 snapshots
     try:
         from instate.core.snapshot import create_snapshot  # noqa: F401
 
         checks.append(("L1 snapshots", "ok — incremental rebuild available"))
     except Exception as e:
         checks.append(("L1 snapshots", f"missing: {e}"))
-    # 2 vault
     try:
         from instate.core.vault import vault
 
         checks.append(("Vault", f"ok — {type(vault).__name__}"))
     except Exception as e:
         checks.append(("Vault", f"missing: {e}"))
-    # 3 crypto
     try:
         from instate.core.crypto import get_fernet
 
         checks.append(("Encryption at rest", "ok" if get_fernet() else "no key set (set INSTATE_ENCRYPTION_KEY)"))
     except Exception as e:
         checks.append(("Encryption", str(e)))
-    # 4 RLS
     checks.append(("RLS DDL", f"{len(rls_ddl())} statements"))
-    # 5 standalone verifier
     checks.append(("Standalone verifier", "ok — instate/verify/standalone.py"))
-    # 6 failover
     checks.append(("LLM failover", "ok — adapters/failover.py"))
-    # 7 archive
     checks.append(("Cold archive", "ok — core/archive.py (chain-walkable)"))
-    # 8 HITL
     checks.append(("HITL queue", "ok — core/hitl.py"))
-    # 9 rollout
     checks.append(("Staged rollout", "ok — core/rollout.py"))
-    # 10 privacy
     checks.append(("Network privacy", "ok — core/privacy.py (k-threshold)"))
-    # 11 eval/chaos
     checks.append(("Continuous eval", "ok — evals/runner.py"))
     checks.append(("Chaos harness", "ok — testing/chaos.py"))
 
@@ -800,7 +876,7 @@ async def _prod_cmd():
 
 
 # ---------------------------------------------------------------------------
-# instate serve — run the surfaces for manual testing (§8, §10)
+# instate serve
 # ---------------------------------------------------------------------------
 
 serve_app = typer.Typer(help="Run a surface server for manual testing.", no_args_is_help=True)
@@ -859,7 +935,7 @@ def serve_mcp(
     allow_writes: bool = typer.Option(False, help="Enable the write tool (capability-gated)."),
     api_key: str = typer.Option(None, help="Bearer token required when set (else INSTATE_MCP_API_KEY)."),
 ):
-    """Start the stateless MCP server (POST /mcp). supermemory/Context.dev-shaped."""
+    """Start the stateless MCP server (POST /mcp)."""
     import uvicorn
 
     from instate.core.config import Config

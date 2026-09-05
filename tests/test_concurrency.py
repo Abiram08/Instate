@@ -1,15 +1,6 @@
-"""Concurrency — the TOCTOU P0 (§6).
-
-Two pipelines for the SAME entity, truly concurrent (two sessions, one
-file DB, asyncio.gather). The entity sits at 2/3 retries: the first
-pipeline to complete takes the 3rd attempt; the second MUST observe the
-ceiling and DENY — never a 4th RetryAttempted.
-
-Without the process-wide per-entity lock (`core.locks`), both pipelines
-pass Gate-1 on SQLite (where FOR UPDATE is a dialect no-op) and double-act.
-The negative test below pins exactly that failure mode, so a regression
-that drops the lock turns red instead of silent.
-"""
+"""Concurrency (TOCTOU): two pipelines, one entity at 2/3 retries.
+First to complete takes the 3rd attempt; second must DENY, never a 4th RetryAttempted.
+Without the per-entity lock, both pass Gate-1 on SQLite (FOR UPDATE is a no-op) and double-act."""
 
 import asyncio
 from datetime import timedelta
@@ -63,12 +54,7 @@ async def _file_db(tmp_path):
 
 
 async def _seed_below_ceiling(session, merchant, entity_id, *, now):
-    """Policy + map + taxonomy; entity at 2/3 retries in-window.
-
-    Retries sit 3d and 2d back: inside the 7d ceiling window (so the 3rd
-    attempt fills it) but outside the 24h spacing window (so Gate-1
-    passes on a quiet entity).
-    """
+    """Policy/map/taxonomy; 2/3 retries in-window but outside 24h spacing."""
     await seed_default_policy(session)
     await seed_default_diagnosis(session)
     await seed_default_taxonomy(session)
@@ -99,8 +85,7 @@ async def _retry_count(session, merchant, entity_id) -> int:
 
 
 async def test_concurrent_pipelines_serialize_on_one_entity(tmp_path):
-    """The P0: two concurrent failures, one entity at 2/3 → exactly one
-    more attempt, the other DENY. No 4th RetryAttempted, ever."""
+    """Two concurrent failures at 2/3 → one executes, one DENY; never 4 attempts."""
     engine, factory = await _file_db(tmp_path)
     merchant = make_merchant_id()
     entity_id = "sub_race"
@@ -140,17 +125,13 @@ async def test_concurrent_pipelines_serialize_on_one_entity(tmp_path):
 
     paths = sorted(r.path for r in results)
     assert paths == ["gate1_deny", "llm"], f"expected one execution + one deny, got {paths}"
-    assert len(gateway.calls) == 1  # exactly one Razorpay call
+    assert len(gateway.calls) == 1
 
     await engine.dispose()
 
 
 async def test_gates_alone_cannot_serialize_on_sqlite(tmp_path):
-    """The negative control: two bare `evaluate()` calls both see 2/3 and
-    both ALLOW — gates without the app lock cannot serialize on SQLite.
-    This is WHY the per-entity lock exists; if this test ever fails, the
-    lock may have become redundant (good problem to have — then delete
-    the lock and this test together)."""
+    """Negative control: bare evaluate() calls both ALLOW on SQLite; gates alone cannot serialize."""
     engine, factory = await _file_db(tmp_path)
     merchant = make_merchant_id()
     entity_id = "sub_bare"
@@ -174,8 +155,7 @@ async def test_gates_alone_cannot_serialize_on_sqlite(tmp_path):
 
 
 async def test_locks_are_per_entity(tmp_path):
-    """Same entity → same lock (serializes). Different entity → different
-    lock (never blocks)."""
+    """Locks are per-entity, not global."""
     merchant = make_merchant_id()
     assert get_entity_lock(merchant, "sub_x") is get_entity_lock(merchant, "sub_x")
     assert get_entity_lock(merchant, "sub_x") is not get_entity_lock(merchant, "sub_y")
@@ -184,8 +164,7 @@ async def test_locks_are_per_entity(tmp_path):
 
 
 async def test_concurrent_pipelines_on_different_entities_both_execute(tmp_path):
-    """Serialization is per-entity, not global: two entities at 2/3 both
-    take their 3rd attempt concurrently."""
+    """Different entities do not block each other."""
     engine, factory = await _file_db(tmp_path)
     merchant = make_merchant_id()
     now = now_utc()
@@ -238,11 +217,7 @@ async def test_concurrent_pipelines_on_different_entities_both_execute(tmp_path)
 
 
 class BlockingGateway:
-    """Simulates a slow Razorpay call: blocks inside execute() until
-    released. While blocked, the first pipeline has committed its INTENT
-    but not its RetryAttempted outcome — exactly the window where a
-    concurrent pipeline's Gate-2 recheck is blind (intents aren't
-    counted, only outcomes are)."""
+    """Slow gateway: blocks in execute() with intent committed but outcome unwritten."""
 
     def __init__(self):
         self.calls: list[dict] = []
@@ -256,9 +231,7 @@ class BlockingGateway:
 
 
 async def test_slow_gateway_cannot_reopen_the_race(tmp_path):
-    """The production-shape race: slow gateway + concurrent pipelines.
-    The second pipeline must still observe the ceiling and DENY — the
-    app lock holds it outside Gate-1 until the first run fully commits."""
+    """Slow gateway + concurrent pipelines still serializes via the app lock."""
     engine, factory = await _file_db(tmp_path)
     merchant = make_merchant_id()
     entity_id = "sub_slow"
@@ -298,8 +271,7 @@ async def test_slow_gateway_cannot_reopen_the_race(tmp_path):
                 )
 
         tasks = [asyncio.create_task(run_one(t)) for t in trigger_ids]
-        # Let the first pipeline reach the gateway and block there; the
-        # second must still be parked outside Gate-1 by the app lock.
+        # Second pipeline stays parked outside Gate-1 while the first is blocked.
         for _ in range(200):
             if len(gateway.calls) >= 1:
                 break
@@ -307,7 +279,7 @@ async def test_slow_gateway_cannot_reopen_the_race(tmp_path):
         assert len(gateway.calls) == 1, (
             f"second pipeline entered execute while first was blocked: {gateway.calls}"
         )
-        gateway.calls.clear()  # reset for the post-release count below
+        gateway.calls.clear()
         release.set()
         results = await asyncio.gather(*tasks)
     finally:

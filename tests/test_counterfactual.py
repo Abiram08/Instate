@@ -1,9 +1,4 @@
-"""Tests for the counterfactual replay (§9, build item 14).
-
-The policy simulator: re-decide history under an overridden policy,
-at the original decision times, and project the impact — the question
-every collections team has and none can currently answer.
-"""
+"""Counterfactual replay under overridden policy."""
 
 from datetime import timedelta
 
@@ -44,13 +39,11 @@ async def seed_all(session):
 
 
 async def test_replay_stricter_ceiling_flags_history(session: AsyncSession):
-    """retry_ceiling_7d 3→2: a historical decision made with 2 prior
-    retries would now be DENY — the simulator must see it."""
+    """Pins 3->2 ceiling: 2 prior retries flips ALLOW to DENY."""
     merchant = make_merchant_id()
     await seed_all(session)
 
     entity = "cf_a"
-    # History: 2 retries (under the OLD ceiling of 3, over the NEW of 2)
     for i in range(2):
         await record_event(
             session,
@@ -63,7 +56,6 @@ async def test_replay_stricter_ceiling_flags_history(session: AsyncSession):
         )
     await session.commit()
 
-    # A decision made at that time (as the pipeline would have recorded)
     g1 = await evaluate(
         session,
         merchant_id=merchant,
@@ -89,8 +81,6 @@ async def test_replay_stricter_ceiling_flags_history(session: AsyncSession):
 
 
 async def test_replay_shadow_policy_does_not_disturb_v1(session: AsyncSession):
-    """The simulator creates v2 shadow rows — the in-force policy v1 is
-    untouched (read-only replay, never a rewrite of the present)."""
     merchant = make_merchant_id()
     await seed_all(session)
 
@@ -104,14 +94,11 @@ async def test_replay_shadow_policy_does_not_disturb_v1(session: AsyncSession):
 
 
 async def test_replay_money_projection(session: AsyncSession):
-    """A decision that actually recovered money, denied by the new policy
-    → projected recovered-lost. And a doomed attempt → avoided."""
     merchant = make_merchant_id()
     await seed_all(session)
 
     entity = "cf_money"
-    # 2 prior retries, spaced >24h apart (clear of the spacing rule) —
-    # the OLD ceiling of 3 allowed a 3rd; the NEW ceiling of 2 denies it
+    # 2 retries spaced >24h (clear of spacing rule).
     for i, back in enumerate([3.0, 2.0]):
         await record_event(
             session,
@@ -136,7 +123,6 @@ async def test_replay_money_projection(session: AsyncSession):
     decision.executed_action = "RETRY_NOW"
     await session.commit()
 
-    # The third retry recovered money (linked to this decision)
     await record_event(
         session,
         merchant_id=merchant,
@@ -164,13 +150,9 @@ async def test_replay_unseeded_policy_raises(session: AsyncSession):
 
 
 async def test_replay_loosened_denied_decision_is_reported_not_scored(session: AsyncSession):
-    """Loosening a policy over a decision that was DENIED (and never
-    executed) IS a verdict change worth reporting — but it contributes no
-    money projection, because nothing ever executed."""
     merchant = make_merchant_id()
     await seed_all(session)
 
-    # 4 retries → DENY at the old ceiling
     for i in range(4):
         await record_event(
             session,
@@ -190,12 +172,12 @@ async def test_replay_loosened_denied_decision_is_reported_not_scored(session: A
         action_class="RETRY_NOW",
         root_cause="insufficient_funds",
     )
-    assert g1.verdict == "DENY"  # the decision existed, denied
+    assert g1.verdict == "DENY"
     await session.commit()
 
     report = await replay_with_policy(
         session, overrides={"retry_ceiling_7d": 5}, merchant_id=merchant
     )
     await session.commit()
-    assert report.looser == 1  # DENY→ALLOW, reported
-    assert report.projected_recovered_lost_minor == 0  # nothing executed → nothing lost
+    assert report.looser == 1
+    assert report.projected_recovered_lost_minor == 0

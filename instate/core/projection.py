@@ -1,19 +1,7 @@
-"""Instate L1 projection — pure fold over L0, rebuildable at any moment.
+"""L1 projection: pure fold of L0 into current entity state (§2).
 
-This is the "now" tier (§2 of architecture.md). It holds only what
-folds cleanly: the state-machine position and point-in-time scalars.
-
-Key design decisions:
-- Windowed counters (retry_count_7d, contacts_24h) are NOT stored here.
-  A fold over an append-only log cannot age out a 7-day window —
-  caching them would drift by construction. Instead, gate-check
-  computes them as indexed L0 counts (get_windowed_count below).
-- The fold processes events in id order (recorded_at semantics).
-  A late-arriving event (out-of-order occurred_at) appends and
-  affects only FUTURE decisions; it never rewrites a past one.
-- instate rebuild() drops L1, replays all of L0, and diffs —
-  a ten-second proof that the ledger is complete and the derived
-  state is honest.
+Windowed counts are computed as indexed L0 counts, never cached.
+Fold and rebuild walk events in insertion (id) order.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -28,6 +16,7 @@ from instate.core.models import (
     EntityState,
     STATUS_ACTIVE,
     STATUS_DIAGNOSED,
+    STATUS_PAUSED,
     STATUS_RETRY_SCHEDULED,
     STATUS_AWAITING_PROMISE,
     STATUS_ESCALATED,
@@ -40,8 +29,7 @@ from instate.core.models import (
 # State machine transitions
 # ---------------------------------------------------------------------------
 
-# Event type → status transition (the state machine from §6)
-# This is the complete fold logic: each event maps to a state change.
+# Event type → status transition (§6).
 TRANSITIONS: dict[str, str | None] = {
     # Failure events
     "PaymentFailed": STATUS_DIAGNOSED,
@@ -70,6 +58,12 @@ TRANSITIONS: dict[str, str | None] = {
     "WrittenOff": STATUS_WRITTEN_OFF,
     # Contact tracking (no status change)
     "CustomerContacted": None,
+    # Pause lifecycle — parked, not dead (reactivation is one event)
+    "SubscriptionPaused": STATUS_PAUSED,
+    "SubscriptionResumed": STATUS_DIAGNOSED,
+    # Prevention + method-check observations (no status change)
+    "CardExpiring": None,
+    "MethodCheckCompleted": None,
     # Checkout/invoice lifecycle (thin consumers)
     "CheckoutAbandoned": STATUS_DIAGNOSED,
     "InvoiceOverdue": STATUS_DIAGNOSED,
@@ -95,23 +89,14 @@ AMOUNT_EVENTS = {"PaymentFailed", "InvoiceOverdue", "CheckoutAbandoned"}
 
 
 def apply_event(state: EntityState, event: Event) -> EntityState:
-    """Apply a single event to an EntityState (pure fold step).
-
-    This is the ONLY function that mutates EntityState. It is called
-    by fold_events() (incremental) and rebuild() (full replay).
-
-    The fold is deterministic: same events in same order → same state.
-    """
-    # Status transition
+    """Apply one event to EntityState; deterministic for the same order."""
     new_status = TRANSITIONS.get(event.event_type)
     if new_status is not None:
         state.status = new_status
 
-    # Contact tracking
     if event.event_type in CONTACT_EVENTS:
         state.last_contact_at = event.occurred_at
 
-    # Promise-to-pay tracking
     if event.event_type in PTP_SET_EVENTS and event.payload:
         due_at = event.payload.get("due_at")
         if due_at:
@@ -122,19 +107,40 @@ def apply_event(state: EntityState, event: Event) -> EntityState:
     elif event.event_type in PTP_CLEAR_EVENTS:
         state.open_ptp_due_at = None
 
-    # Failure reason
     if event.event_type in FAILURE_REASON_EVENTS and event.payload:
         state.last_failure_reason = event.payload.get("root_cause") or event.payload.get(
             "failure_code"
         )
 
-    # Amount at risk
     if event.event_type in AMOUNT_EVENTS and event.payload:
         amount = event.payload.get("amount_minor")
         if amount is not None and isinstance(amount, int):
             state.amount_at_risk_minor = amount
 
-    # Watermark
+    # Store only IANA timezones zoneinfo accepts; bad values are ignored.
+    if event.event_type == "PaymentFailed" and event.payload:
+        tz_name = event.payload.get("customer_tz")
+        if isinstance(tz_name, str):
+            try:
+                from zoneinfo import ZoneInfo
+
+                ZoneInfo(tz_name)
+                state.timezone = tz_name
+            except Exception:
+                pass
+
+    # Partial card-expiry data is ignored, never stored half-true.
+    if event.event_type == "CardExpiring" and event.payload:
+        year = event.payload.get("exp_year")
+        month = event.payload.get("exp_month")
+        if (
+            isinstance(year, int)
+            and isinstance(month, int)
+            and 1 <= month <= 12
+        ):
+            state.card_exp_year = year
+            state.card_exp_month = month
+
     state.last_event_id = event.id
 
     return state
@@ -146,16 +152,7 @@ def apply_event(state: EntityState, event: Event) -> EntityState:
 
 
 async def fold_events(session: AsyncSession) -> int:
-    """Incrementally fold new events into entity_state (from watermark).
-
-    For each entity with events past its watermark:
-    1. Fetch events after last_event_id
-    2. Apply each in order (apply_event)
-    3. Update the watermark
-
-    Returns the number of events folded.
-    """
-    # Find all entities that have events past their watermark
+    """Fold events past each entity's watermark; returns events folded."""
     entities_needing_fold = await session.execute(
         select(Event.merchant_id, Event.entity_id, func.max(Event.id).label("max_id"))
         .group_by(Event.merchant_id, Event.entity_id)
@@ -168,7 +165,6 @@ async def fold_events(session: AsyncSession) -> int:
     folded_count = 0
 
     for merchant_id, entity_id, max_event_id in entity_ids:
-        # Get or create the entity state
         state = await session.get(EntityState, (merchant_id, entity_id))
         if state is None:
             first_event = await session.execute(
@@ -188,11 +184,9 @@ async def fold_events(session: AsyncSession) -> int:
             session.add(state)
             await session.flush()
 
-        # Skip if no new events
         if state.last_event_id >= max_event_id:
             continue
 
-        # Fetch events past the watermark
         new_events = await session.execute(
             select(Event)
             .where(
@@ -218,14 +212,7 @@ async def fold_events(session: AsyncSession) -> int:
 
 
 async def rebuild(session: AsyncSession) -> dict[str, int]:
-    """Drop all of L1, replay all of L0, and report the diff.
-
-    This is the ten-second proof that the ledger is complete and
-    the derived state is honest. If rebuild produces different state
-    than what was there before, the projection had drifted —
-    and that's a bug worth knowing about.
-    """
-    # Snapshot current state for the diff
+    """Drop L1, replay L0, and report drift (mismatches = projection bug)."""
     old_states = await session.execute(select(EntityState))
     old_state_map: dict[tuple[UUID, str], dict[str, Any]] = {
         (s.merchant_id, s.entity_id): {
@@ -239,14 +226,11 @@ async def rebuild(session: AsyncSession) -> dict[str, int]:
         for s in old_states.scalars()
     }
 
-    # Drop all L1 rows
     await session.execute(delete(EntityState))
     await session.flush()
 
-    # Replay all of L0
     events_folded = await fold_events(session)
 
-    # Diff: compare new state against snapshot
     new_states = await session.execute(select(EntityState))
     new_state_map: dict[tuple[UUID, str], dict[str, Any]] = {
         (s.merchant_id, s.entity_id): {
@@ -260,9 +244,6 @@ async def rebuild(session: AsyncSession) -> dict[str, int]:
         for s in new_states.scalars()
     }
 
-    # Compare (a drifted projection would show differences).
-    # An initial build (old_state_map empty) is not drift — it's the
-    # first time the fold has run.
     matches = 0
     mismatches = 0
     initial_build = not old_state_map
@@ -313,26 +294,14 @@ async def get_windowed_count(
     event_types: set[str] | None = None,
     now: datetime | None = None,
     as_of: datetime | None = None,
+    channel: str | None = None,
 ) -> int:
-    """Compute a windowed count over L0 (indexed, sub-ms, never drifts).
+    """Indexed L0 count over a window; never cached, never drifts.
 
-    This is the gate-check primitive (§2 of architecture.md):
-    windowed counters are deliberately NOT cached in L1 because a
-    fold cannot age out a window. This count is always exactly correct
-    because it queries the immutable ledger directly.
-
-    `now` is injectable so window-edge tests can pin the clock.
-    `as_of` is the KNOWLEDGE cutoff (§1b bi-temporal): when given, only
-    events recorded at or before `as_of` count. It defaults to None
-    (no cutoff — live checks see everything learned so far), so all
-    existing callers are unaffected. Replaying a past decision passes
-    `now=as_of=T`: the window anchors at T AND the knowledge cutoff sits
-    at T, reproducing EXACTLY what was known at T — a late-arriving
-    event (old occurred_at, new recorded_at) affects only future
-    decisions, never rewrites a past one.
+    `as_of` is the knowledge cutoff (replay passes now=as_of=T); `channel`
+    filters the indexed Event.channel column, never the payload.
     """
     now = now or datetime.now(UTC)
-    # Resolve the metric to event types
     if event_types is None:
         if metric == "retry_count_7d":
             event_types = RETRY_EVENT_TYPES
@@ -350,6 +319,8 @@ async def get_windowed_count(
     ]
     if as_of is not None:
         filters.append(Event.recorded_at <= as_of)
+    if channel is not None:
+        filters.append(Event.channel == channel)
 
     count_result = await session.execute(
         select(func.count(Event.id)).where(*filters)
@@ -358,7 +329,7 @@ async def get_windowed_count(
 
 
 # ---------------------------------------------------------------------------
-# Payment-method dimension (§6, Stripe lesson) — the hard-decline unblock
+# Payment-method dimension (§6): the hard-decline unblock
 # ---------------------------------------------------------------------------
 
 
@@ -389,17 +360,9 @@ async def has_new_method_since_last_failure(
     entity_id: str,
     now: datetime | None = None,
 ) -> bool:
-    """Does the entity have NEW-method evidence — a PaymentMethodChanged
-    event that postdates its most recent failure?
+    """True if a PaymentMethodChanged postdates the last PaymentFailed.
 
-    This is the gate the hard-decline rule consults: a retry for a
-    hard-declined method is only legal once the customer has actually
-    changed the method AFTER the failure that dead-ended it.
-
-    - No PaymentMethodChanged on file at all → False (no evidence, no
-      unblock — a hard decline stays blocked).
-    - Method change but no failure → True (a fresh method is on file).
-    - Otherwise: change must postdate the last failure.
+    No change on file → False; change with no failure → True.
     """
     failure_q = await session.execute(
         select(Event.occurred_at)
@@ -430,3 +393,63 @@ async def has_new_method_since_last_failure(
     if last_failure is None:
         return True  # fresh method on file, nothing dead-ended
     return last_change > last_failure
+
+
+# ---------------------------------------------------------------------------
+# Payday inference — learned timing, not guessed (§6, Stripe lesson)
+# ---------------------------------------------------------------------------
+
+# Event types whose occurred_at marks "money was here" — the payday signal.
+SUCCESS_EVENT_TYPES = {"RetrySucceeded", "PaymentRecovered", "PromiseHonored"}
+
+
+async def infer_payday(
+    session: AsyncSession,
+    *,
+    merchant_id: UUID,
+    entity_id: str,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Next likely payday (day-of-month cluster, ≥2 hits, 10:00 UTC) or None.
+
+    Sparse history returns None; caller falls back to T+48H.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=90)
+    result = await session.execute(
+        select(Event.occurred_at).where(
+            Event.merchant_id == merchant_id,
+            Event.entity_id == entity_id,
+            Event.event_type.in_(SUCCESS_EVENT_TYPES),
+            Event.occurred_at > cutoff,
+            Event.occurred_at <= now,
+        )
+    )
+    doms = sorted(ts.day for ts in (r[0] for r in result.all()) if ts is not None)
+    if len(doms) < 2:
+        return None
+
+    # ±1-day buckets over events (not distinct days); month edges wrap.
+    best_day: int | None = None
+    for anchor in doms:
+        bucket = [d for d in doms if abs(d - anchor) <= 1 or abs(d - anchor) >= 27]
+        if len(bucket) >= 2:
+            best_day = anchor
+            break
+    if best_day is None:
+        return None
+
+    # Next occurrence at 10:00 UTC; today counts if morning hasn't passed.
+    import calendar
+
+    def _payday(year: int, month: int) -> datetime:
+        last_day = calendar.monthrange(year, month)[1]
+        return datetime(year, month, min(best_day, last_day), 10, 0, tzinfo=UTC)
+
+    candidate = _payday(now.year, now.month)
+    if candidate <= now:
+        month = now.month + 1
+        year = now.year + (1 if month > 12 else 0)
+        month = 1 if month > 12 else month
+        candidate = _payday(year, month)
+    return candidate

@@ -1,9 +1,4 @@
-"""Cold archive — chain-walkable (§15).
-
-Rows past the retention window move to cold storage (file/Parquet/S3),
-but per-entity anchors survive in `archive_anchors` so a full export
-still verifies: cold rows + hot rows + anchor = unbroken chain.
-"""
+"""Cold archive: chain-walkable export with per-entity anchors (§15)."""
 
 import json
 from datetime import datetime, timedelta, UTC
@@ -31,18 +26,8 @@ async def archive_old_events(
 ) -> dict:
     """Move events older than retention to export files; keep anchors.
 
-    TWO predicates must BOTH hold before a row may leave the hot table:
-      - recorded_at < retention cutoff (the retention rule), AND
-      - occurred_at < now - max_policy_window (the correctness rule).
-
-    The second is the load-bearing one: gate counters (`retry_count_7d`,
-    `contacts_24h`) are indexed counts over occurred_at. Archiving a row
-    whose occurred_at is still inside a live window would make the
-    counts undercount and Gate-1 would wrongly ALLOW — a compliance
-    breach manufactured by housekeeping. Rows held back are reported
-    as `skipped_in_window` so the clamp is visible, not silent.
-
-    Returns {archived, anchors, files, skipped_in_window}.
+    Rows leave only when recorded_at is past retention AND occurred_at is
+    outside every live gate window; held-back rows report as skipped_in_window.
     """
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=retention_days)
@@ -80,7 +65,6 @@ async def archive_old_events(
     anchors = 0
     for (mid, eid), evts in by_entity.items():
         last = evts[-1]
-        # anchor: last hash before the cut
         session.add(
             ArchiveAnchor(
                 merchant_id=mid,
@@ -91,7 +75,6 @@ async def archive_old_events(
             )
         )
         anchors += 1
-        # export file per entity
         p = export_dir / f"{mid}_{eid}_{cutoff.date()}.jsonl"
         with p.open("a") as f:
             for e in evts:
@@ -112,8 +95,7 @@ async def archive_old_events(
                 )
         files.append(str(p))
 
-    # delete from hot table — the EXACT same predicate as the select
-    # above (recorded old AND occurred outside every live gate window)
+    # Delete with the same predicate as the select above.
     await session.execute(
         delete(Event).where(Event.recorded_at < cutoff, Event.occurred_at < live_floor)
     )

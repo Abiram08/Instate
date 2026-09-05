@@ -1,8 +1,4 @@
-"""Tests for the console — the read-only memory wall.
-
-A console that cannot act is the point: GET routes only, entity states,
-windowed counters, and every decision's reason chain rendered.
-"""
+"""Read-only console routes and rendering."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -45,7 +41,6 @@ def console_client(tmp_path):
             )
             await session.commit()
             await fold_events(session)
-            # one decision so the wall has a chain to render
             await evaluate(
                 session,
                 merchant_id=merchant,
@@ -70,18 +65,17 @@ def test_index_lists_entities_with_counters(console_client):
     resp = client.get("/")
     assert resp.status_code == 200
     html = resp.text
-    assert "sub_wall" in html  # the entity link
-    assert "retries · 7d" in html  # the counters the gates enforce
+    assert "sub_wall" in html
+    assert "retries · 7d" in html
     assert "memory wall" in html
 
 
 def test_index_has_no_forms_or_posts(console_client):
-    """Read-only by construction: no forms in the markup, no POST routes."""
     client, _ = console_client
     html = client.get("/").text
     assert "<form" not in html
     post = client.post("/", content=b"x")
-    assert post.status_code == 405  # Method Not Allowed
+    assert post.status_code == 405
 
 
 def test_entity_page_renders_chain_and_decision(console_client):
@@ -89,8 +83,8 @@ def test_entity_page_renders_chain_and_decision(console_client):
     resp = client.get(f"/entity/{merchant}/sub_wall")
     assert resp.status_code == 200
     html = resp.text
-    assert "PaymentFailed" in html  # the timeline
-    assert "retry_ceiling_7d" in html  # the gate-1 chain
+    assert "PaymentFailed" in html
+    assert "retry_ceiling_7d" in html
     assert "decision #" in html
 
 

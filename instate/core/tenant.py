@@ -1,9 +1,4 @@
-"""Tenant isolation — RLS as code (§15) + application guard.
-
-Postgres RLS is the hard wall: even a bug that forgets `WHERE merchant_id`
-cannot leak rows. The helpers here emit the DDL and provide a session-level
-guard for SQLite/test as well.
-"""
+"""Tenant isolation via Postgres RLS + app guard (§15). RLS fail-closed: missing WHERE cannot leak rows."""
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
