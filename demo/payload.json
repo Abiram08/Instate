@@ -1,1 +1,0 @@
-{"event": "payment.failed", "id": "evt_test_001", "payload": {"payment": {"id": "pay_9A1B", "error_reason": "insufficient_funds", "amount": 49900}}}
